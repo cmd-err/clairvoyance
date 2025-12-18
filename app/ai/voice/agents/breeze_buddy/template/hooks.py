@@ -239,6 +239,146 @@ class UpdateOutcomeInDatabaseHook(Hook):
             )
 
 
+class CurlHook(Hook):
+    """
+    Hook to call external HTTP endpoints.
+
+    This hook makes HTTP requests to external APIs/services asynchronously.
+    It supports configurable URL, method, headers, and request body.
+    """
+
+    def __init__(self):
+        super().__init__("curl_hook")
+
+    async def execute(
+        self,
+        context: TemplateContext,
+        args: Dict[str, Any],
+        function_name: str,
+        expected_fields: Optional[Dict[str, HookFieldConfig]] = None,
+    ) -> None:
+        """
+        Execute HTTP request to external endpoint.
+
+        Args:
+            context: Handler context with bot state access
+            args: Function arguments from LLM
+            function_name: Name of the function that triggered this hook
+            expected_fields: Dictionary mapping field names to their HookFieldConfig
+                Expected fields:
+                - url (required): The endpoint URL
+                - method (optional): HTTP method (GET, POST, PUT, DELETE, PATCH). Default: POST
+                - headers (optional): Request headers as dict
+                - body (optional): Request body as dict
+                - timeout (optional): Request timeout in seconds. Default: 10
+        """
+        logger.debug(
+            f"CurlHook execute called with args: {args}, "
+            f"expected_fields: {expected_fields}, for function '{function_name}'"
+        )
+
+        if not expected_fields:
+            logger.error(
+                f"No expected_fields provided for curl_hook in function '{function_name}'. "
+                "At minimum, 'url' field is required."
+            )
+            return
+
+        # Build request configuration from expected_fields
+        request_config: Dict[str, Any] = {}
+
+        for field_name, field_config in expected_fields.items():
+            if field_config.source == HookFieldConfigSource.STATIC:
+                # Use the enforced value from configuration
+                request_config[field_name] = field_config.value
+                logger.debug(
+                    f"Field '{field_name}': using static value '{field_config.value}' "
+                    f"for function '{function_name}'"
+                )
+            elif field_config.source == HookFieldConfigSource.LLM:
+                # Use the value from LLM arguments
+                value = args.get(field_name)
+                if value is not None:
+                    request_config[field_name] = value
+                    logger.debug(
+                        f"Field '{field_name}': using LLM-inferred value '{value}' "
+                        f"for function '{function_name}'"
+                    )
+                else:
+                    logger.warning(
+                        f"Field '{field_name}': type is 'llm' but no value found in args "
+                        f"for function '{function_name}'. Args: {args}"
+                    )
+
+        # Extract and validate required fields
+        url = request_config.get("url")
+        if not url:
+            logger.error(
+                f"No URL provided for curl_hook in function '{function_name}'. "
+                f"Request config: {request_config}"
+            )
+            return
+
+        # Extract optional fields with defaults
+        method = request_config.get("method", "POST").upper()
+        headers = request_config.get("headers", {})
+        body = request_config.get("body", {})
+        timeout = request_config.get("timeout", 10)
+
+        logger.info(
+            f"Executing HTTP {method} request to {url} for function '{function_name}'"
+        )
+
+        # Get aiohttp session from context
+        session = context.aiohttp_session
+        if not session:
+            logger.error(
+                f"No aiohttp_session available in context for function '{function_name}'"
+            )
+            return
+
+        try:
+            # Prepare request kwargs
+            request_kwargs = {
+                "headers": headers,
+                "timeout": timeout,
+            }
+
+            # Add body for methods that support it
+            if method in ["POST", "PUT", "PATCH"] and body:
+                # Set default content type if not specified
+                if "Content-Type" not in headers and "content-type" not in headers:
+                    headers["Content-Type"] = "application/json"
+                    request_kwargs["headers"] = headers
+
+                request_kwargs["json"] = body
+
+            # Make HTTP request
+            async with session.request(method, url, **request_kwargs) as response:
+                response_status = response.status
+                response_text = await response.text()
+
+                logger.info(
+                    f"HTTP {method} request to {url} completed with status {response_status} "
+                    f"for function '{function_name}'"
+                )
+                logger.debug(
+                    f"Response body: {response_text[:500]}..."  # Log first 500 chars
+                )
+
+                if response_status >= 400:
+                    logger.warning(
+                        f"HTTP {method} request to {url} returned error status {response_status} "
+                        f"for function '{function_name}'. Response: {response_text[:200]}"
+                    )
+
+        except Exception as e:
+            logger.error(
+                f"Error executing HTTP {method} request to {url} for function '{function_name}': {str(e)}",
+                exc_info=True,
+            )
+
+
 class HookRegistry:
     """
     Registry for all available hooks.
@@ -285,3 +425,4 @@ class HookRegistry:
 
 # Register hooks
 HookRegistry.register("update_outcome_in_database", UpdateOutcomeInDatabaseHook())
+HookRegistry.register("curl_hook", CurlHook())
