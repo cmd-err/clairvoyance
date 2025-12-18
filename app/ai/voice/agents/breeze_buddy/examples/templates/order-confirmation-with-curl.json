@@ -1,0 +1,403 @@
+{
+  "merchant": "breeze",
+  "template_name": "order-confirmation-with-curl",
+  "is_active": true,
+  "description": "Order confirmation workflow with curl_hook examples for external API integration",
+  "expected_payload_schema": {
+    "customer_name": {
+      "type": "string"
+    },
+    "shop_name": {
+      "type": "string"
+    },
+    "total_price": {
+      "type": "number"
+    },
+    "customer_address": {
+      "type": "string"
+    },
+    "customer_mobile_number": {
+      "type": "string"
+    },
+    "order_id": {
+      "type": "string"
+    },
+    "merchant_webhook_url": {
+      "type": "string"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "product_name": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number"
+          }
+        }
+      }
+    }
+  },
+  "expected_callback_response_schema": {
+    "cancellation_reason": {
+      "type": "string",
+      "optional": true
+    },
+    "updated_address": {
+      "type": "string",
+      "optional": true
+    }
+  },
+  "flow": {
+    "initial_node": "initial",
+    "end_conversation_callbacks": ["service_callback"],
+    "nodes": [
+      {
+        "node_name": "initial",
+        "task_messages": [
+          {
+            "role": "system",
+            "content": "Start the call by introducing yourself: 'Hi {customer_name}, this is from {shop_name}. I'm calling to confirm your order. Is it a good time to talk?'"
+          }
+        ],
+        "role_messages": [
+          {
+            "role": "system",
+            "content": "You are a friendly customer care representative from {shop_name}. Your goal is to confirm an order with the customer."
+          }
+        ],
+        "pre_actions": [],
+        "post_actions": [],
+        "functions": [
+          {
+            "function_name": "user_available",
+            "description": "Call this function when the user confirms they are available to talk",
+            "properties": {},
+            "required": [],
+            "transition_to": "verify_order_detail_node",
+            "hooks": []
+          },
+          {
+            "function_name": "user_busy",
+            "description": "Call this function when the user says they are busy",
+            "properties": {},
+            "required": [],
+            "transition_to": "user_busy_and_end_node",
+            "hooks": [
+              {
+                "name": "update_outcome_in_database",
+                "expected_fields": {
+                  "outcome": {
+                    "source": "static",
+                    "value": "busy"
+                  }
+                }
+              },
+              {
+                "name": "curl_hook",
+                "expected_fields": {
+                  "url": {
+                    "source": "static",
+                    "value": "{merchant_webhook_url}"
+                  },
+                  "method": {
+                    "source": "static",
+                    "value": "POST"
+                  },
+                  "headers": {
+                    "source": "static",
+                    "value": {
+                      "Content-Type": "application/json"
+                    }
+                  },
+                  "body": {
+                    "source": "static",
+                    "value": {
+                      "event": "call_status",
+                      "order_id": "{order_id}",
+                      "status": "customer_busy",
+                      "timestamp": "{{auto}}"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "function_name": "cancel_order",
+            "description": "Call this function if the customer wants to cancel the order",
+            "properties": {
+              "cancellation_reason": {
+                "type": "string",
+                "description": "The reason for cancelling the order"
+              }
+            },
+            "required": ["cancellation_reason"],
+            "transition_to": "order_cancellation_and_end_node",
+            "hooks": [
+              {
+                "name": "update_outcome_in_database",
+                "expected_fields": {
+                  "outcome": {
+                    "source": "static",
+                    "value": "cancelled"
+                  },
+                  "cancellation_reason": {
+                    "source": "llm"
+                  }
+                }
+              },
+              {
+                "name": "curl_hook",
+                "expected_fields": {
+                  "url": {
+                    "source": "static",
+                    "value": "{merchant_webhook_url}"
+                  },
+                  "method": {
+                    "source": "static",
+                    "value": "POST"
+                  },
+                  "headers": {
+                    "source": "static",
+                    "value": {
+                      "Content-Type": "application/json"
+                    }
+                  },
+                  "body": {
+                    "source": "static",
+                    "value": {
+                      "event": "order_cancelled",
+                      "order_id": "{order_id}"
+                    }
+                  },
+                  "cancellation_reason": {
+                    "source": "llm"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "node_name": "verify_order_detail_node",
+        "task_messages": [
+          {
+            "role": "system",
+            "content": "Verify the order details with the customer. The total price is {total_price} rupees. The delivery address is {customer_address}. Ask for confirmation."
+          }
+        ],
+        "pre_actions": [],
+        "post_actions": [],
+        "functions": [
+          {
+            "function_name": "confirm_order",
+            "description": "Call this function if the customer confirms the order",
+            "properties": {},
+            "required": [],
+            "transition_to": "order_confirmation_and_end_node",
+            "hooks": [
+              {
+                "name": "update_outcome_in_database",
+                "expected_fields": {
+                  "outcome": {
+                    "source": "static",
+                    "value": "confirmed"
+                  }
+                }
+              },
+              {
+                "name": "curl_hook",
+                "expected_fields": {
+                  "url": {
+                    "source": "static",
+                    "value": "{merchant_webhook_url}"
+                  },
+                  "method": {
+                    "source": "static",
+                    "value": "POST"
+                  },
+                  "headers": {
+                    "source": "static",
+                    "value": {
+                      "Content-Type": "application/json"
+                    }
+                  },
+                  "body": {
+                    "source": "static",
+                    "value": {
+                      "event": "order_confirmed",
+                      "order_id": "{order_id}",
+                      "customer_name": "{customer_name}",
+                      "total_price": "{total_price}",
+                      "address": "{customer_address}",
+                      "timestamp": "{{auto}}"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "function_name": "cancel_order",
+            "description": "Call this function if the customer wants to cancel",
+            "properties": {
+              "cancellation_reason": {
+                "type": "string",
+                "description": "The reason for cancelling"
+              }
+            },
+            "required": ["cancellation_reason"],
+            "transition_to": "order_cancellation_and_end_node",
+            "hooks": [
+              {
+                "name": "update_outcome_in_database",
+                "expected_fields": {
+                  "outcome": {
+                    "source": "static",
+                    "value": "cancelled"
+                  },
+                  "cancellation_reason": {
+                    "source": "llm"
+                  }
+                }
+              },
+              {
+                "name": "curl_hook",
+                "expected_fields": {
+                  "url": {
+                    "source": "static",
+                    "value": "{merchant_webhook_url}"
+                  },
+                  "method": {
+                    "source": "static",
+                    "value": "POST"
+                  },
+                  "body": {
+                    "source": "static",
+                    "value": {
+                      "event": "order_cancelled",
+                      "order_id": "{order_id}"
+                    }
+                  },
+                  "cancellation_reason": {
+                    "source": "llm"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "function_name": "address_incorrect",
+            "description": "User says the address is wrong",
+            "properties": {
+              "new_address": {
+                "type": "string",
+                "description": "The corrected address"
+              }
+            },
+            "required": ["new_address"],
+            "transition_to": "order_confirmation_and_end_node",
+            "hooks": [
+              {
+                "name": "update_outcome_in_database",
+                "expected_fields": {
+                  "outcome": {
+                    "source": "static",
+                    "value": "address_updated"
+                  },
+                  "updated_address": {
+                    "source": "llm"
+                  }
+                }
+              },
+              {
+                "name": "curl_hook",
+                "expected_fields": {
+                  "url": {
+                    "source": "static",
+                    "value": "{merchant_webhook_url}"
+                  },
+                  "method": {
+                    "source": "static",
+                    "value": "PUT"
+                  },
+                  "headers": {
+                    "source": "static",
+                    "value": {
+                      "Content-Type": "application/json"
+                    }
+                  },
+                  "body": {
+                    "source": "static",
+                    "value": {
+                      "event": "address_updated",
+                      "order_id": "{order_id}"
+                    }
+                  },
+                  "new_address": {
+                    "source": "llm"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "node_name": "order_confirmation_and_end_node",
+        "task_messages": [
+          {
+            "role": "system",
+            "content": "Thank you for confirming your order. Your order will be delivered soon. Have a good day."
+          }
+        ],
+        "pre_actions": [],
+        "post_actions": [
+          {
+            "type": "function",
+            "handler": "end_conversation"
+          }
+        ],
+        "functions": []
+      },
+      {
+        "node_name": "order_cancellation_and_end_node",
+        "task_messages": [
+          {
+            "role": "system",
+            "content": "I understand. I am cancelling your order. Thank you for your time."
+          }
+        ],
+        "pre_actions": [],
+        "post_actions": [
+          {
+            "type": "function",
+            "handler": "end_conversation"
+          }
+        ],
+        "functions": []
+      },
+      {
+        "node_name": "user_busy_and_end_node",
+        "task_messages": [
+          {
+            "role": "system",
+            "content": "I understand. I will call you back later. Thank you."
+          }
+        ],
+        "pre_actions": [],
+        "post_actions": [
+          {
+            "type": "function",
+            "handler": "end_conversation"
+          }
+        ],
+        "functions": []
+      }
+    ]
+  }
+}
