@@ -1,0 +1,164 @@
+{
+  "merchant": "example",
+  "template_name": "curl-hook-example",
+  "is_active": true,
+  "description": "Example template demonstrating curl_hook usage for external API calls",
+  "expected_payload_schema": {
+    "customer_name": {
+      "type": "string"
+    },
+    "customer_id": {
+      "type": "string"
+    },
+    "api_endpoint": {
+      "type": "string"
+    }
+  },
+  "expected_callback_response_schema": {},
+  "flow": {
+    "initial_node": "initial",
+    "end_conversation_callbacks": [],
+    "nodes": [
+      {
+        "node_name": "initial",
+        "task_messages": [
+          {
+            "role": "system",
+            "content": "Greet the customer: 'Hi {customer_name}, thank you for calling. How can I help you today?'"
+          }
+        ],
+        "role_messages": [
+          {
+            "role": "system",
+            "content": "You are a friendly customer service representative. Be polite and helpful."
+          }
+        ],
+        "pre_actions": [],
+        "post_actions": [],
+        "functions": [
+          {
+            "function_name": "confirm_details",
+            "description": "Call this when the customer confirms their details",
+            "properties": {
+              "confirmation_note": {
+                "type": "string",
+                "description": "Any additional notes from the customer"
+              }
+            },
+            "required": [],
+            "transition_to": "end_node",
+            "hooks": [
+              {
+                "name": "curl_hook",
+                "expected_fields": {
+                  "url": {
+                    "source": "static",
+                    "value": "https://api.example.com/customer/update"
+                  },
+                  "method": {
+                    "source": "static",
+                    "value": "POST"
+                  },
+                  "headers": {
+                    "source": "static",
+                    "value": {
+                      "Authorization": "Bearer YOUR_API_KEY",
+                      "Content-Type": "application/json"
+                    }
+                  },
+                  "body": {
+                    "source": "static",
+                    "value": {
+                      "customer_id": "{customer_id}",
+                      "status": "confirmed",
+                      "timestamp": "{{auto}}"
+                    }
+                  },
+                  "timeout": {
+                    "source": "static",
+                    "value": 10
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "function_name": "fetch_custom_data",
+            "description": "Call this when customer asks for their account details",
+            "properties": {
+              "data_type": {
+                "type": "string",
+                "description": "Type of data requested (e.g., 'balance', 'history', 'status')"
+              }
+            },
+            "required": ["data_type"],
+            "transition_to": "show_data_node",
+            "hooks": [
+              {
+                "name": "curl_hook",
+                "expected_fields": {
+                  "url": {
+                    "source": "static",
+                    "value": "https://api.example.com/customer/fetch"
+                  },
+                  "method": {
+                    "source": "static",
+                    "value": "GET"
+                  },
+                  "headers": {
+                    "source": "static",
+                    "value": {
+                      "Authorization": "Bearer YOUR_API_KEY"
+                    }
+                  },
+                  "body": {
+                    "source": "llm",
+                    "value": null
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "node_name": "show_data_node",
+        "task_messages": [
+          {
+            "role": "system",
+            "content": "Tell the customer: 'I've retrieved your data. Is there anything else I can help you with?'"
+          }
+        ],
+        "pre_actions": [],
+        "post_actions": [],
+        "functions": [
+          {
+            "function_name": "end_call",
+            "description": "Call this when the customer is done",
+            "properties": {},
+            "required": [],
+            "transition_to": "end_node",
+            "hooks": []
+          }
+        ]
+      },
+      {
+        "node_name": "end_node",
+        "task_messages": [
+          {
+            "role": "system",
+            "content": "Thank you for calling. Have a great day!"
+          }
+        ],
+        "pre_actions": [],
+        "post_actions": [
+          {
+            "type": "function",
+            "handler": "end_conversation"
+          }
+        ],
+        "functions": []
+      }
+    ]
+  }
+}
