@@ -338,18 +338,19 @@ class CurlHook(Hook):
             return
 
         try:
-            # Prepare request kwargs
+            # Prepare request kwargs with a copy of headers to avoid modifying the original
+            headers_copy = headers.copy() if headers else {}
             request_kwargs = {
-                "headers": headers,
+                "headers": headers_copy,
                 "timeout": timeout,
             }
 
             # Add body for methods that support it
             if method in ["POST", "PUT", "PATCH"] and body:
                 # Set default content type if not specified
-                if "Content-Type" not in headers and "content-type" not in headers:
-                    headers["Content-Type"] = "application/json"
-                    request_kwargs["headers"] = headers
+                if "Content-Type" not in headers_copy and "content-type" not in headers_copy:
+                    headers_copy["Content-Type"] = "application/json"
+                    request_kwargs["headers"] = headers_copy
 
                 request_kwargs["json"] = body
 
@@ -363,13 +364,13 @@ class CurlHook(Hook):
                     f"for function '{function_name}'"
                 )
                 logger.debug(
-                    f"Response body: {response_text[:500]}..."  # Log first 500 chars
+                    f"Response body: {response_text[:500]}{'...' if len(response_text) > 500 else ''}"
                 )
 
                 if response_status >= 400:
                     logger.warning(
                         f"HTTP {method} request to {url} returned error status {response_status} "
-                        f"for function '{function_name}'. Response: {response_text[:200]}"
+                        f"for function '{function_name}'. Response: {response_text[:200]}{'...' if len(response_text) > 200 else ''}"
                     )
 
         except Exception as e:

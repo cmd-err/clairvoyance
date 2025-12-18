@@ -147,6 +147,8 @@ Send a confirmation to an external webhook:
 }
 ```
 
+**Note on Template Variables**: Values in curly braces like `{order_id}` are template variables that are substituted during template loading (by `FlowConfigLoader.load_template()`). These variables must be defined in the template's `expected_payload_schema` and provided in the lead payload when the call is initiated. The substitution happens once at the start of the call, before any nodes are executed.
+
 ### Example 2: GET Request to Fetch Data
 
 Retrieve customer information from an external API:
