@@ -280,6 +280,17 @@ async def lifespan(_app: FastAPI):
             f"Drain period ({BOT_MAX_DRAIN_SECONDS}s) complete. Proceeding with cleanup."
         )
 
+    # Close any live SmallWebRTC peer connections (in-process device/browser
+    # bots) so they don't leak on pod drain.
+    try:
+        from app.api.routers.breeze_buddy.smallwebrtc.handlers import (
+            close_smallwebrtc_handler,
+        )
+
+        await close_smallwebrtc_handler()
+    except Exception as e:
+        logger.error(f"Error closing SmallWebRTC handler: {e}", exc_info=True)
+
     # Close Smart Router client (release HTTP connection pool)
     await close_smart_router_client()
 

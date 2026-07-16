@@ -26,6 +26,7 @@ from app.api.routers.breeze_buddy.playground import router as playground_router
 
 # Self-service signup and Google SSO (public, unauthenticated)
 from app.api.routers.breeze_buddy.signup import router as signup_router
+from app.api.routers.breeze_buddy.smallwebrtc import router as smallwebrtc_router
 from app.api.routers.breeze_buddy.telephony import router as telephony_router
 from app.api.routers.breeze_buddy.template_generator import (
     router as template_generator_router,
@@ -105,6 +106,9 @@ router.include_router(websocket_router, prefix="", tags=["websocket"])
 router.include_router(pod_router, prefix="/pod", tags=["pod"])
 
 router.include_router(daily_router, prefix="", tags=["daily"])
+
+# SmallWebRTC (serverless P2P WebRTC for device/embedded clients; no Daily room)
+router.include_router(smallwebrtc_router, prefix="", tags=["smallwebrtc"])
 
 # Chat (text-mode sessions: REST + SSE, no STT/TTS/VAD)
 router.include_router(chat_router, prefix="", tags=["chat"])

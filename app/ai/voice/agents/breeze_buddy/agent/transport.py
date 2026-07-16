@@ -10,6 +10,7 @@ from typing import Optional
 
 from pipecat.audio.filters.aic_filter import AICFilter
 from pipecat.audio.filters.base_audio_filter import BaseAudioFilter
+from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
@@ -28,6 +29,9 @@ from app.core.logger import logger
 # Constants
 TRANSPORT_TYPE_DAILY = "daily"
 TRANSPORT_TYPE_TELEPHONY = "telephony"
+# Magic string: pipecat's create_transport() looks up transport_params["webrtc"]
+# for SmallWebRTCRunnerArguments (see pipecat/runner/utils.py). Must be "webrtc".
+TRANSPORT_TYPE_WEBRTC = "webrtc"
 
 
 def _get_aic_model_path(transport_type: str) -> Path:
@@ -49,7 +53,7 @@ def _get_aic_model_path(transport_type: str) -> Path:
     Returns:
         Path to the selected AIC model file.
     """
-    if transport_type == TRANSPORT_TYPE_DAILY:
+    if transport_type in (TRANSPORT_TYPE_DAILY, TRANSPORT_TYPE_WEBRTC):
         return Path(static.AIC_MODEL_PATH_16KHZ)
     return Path(static.AIC_MODEL_PATH)
 
@@ -144,6 +148,21 @@ def get_transport_params(
             audio_out_mixer=daily_mixer,
             audio_in_filter=_create_audio_input_filter(
                 configurations, TRANSPORT_TYPE_DAILY
+            ),
+        ),
+        # SmallWebRTC (device/embedded clients) runs at 24 kHz like Daily, so it
+        # reuses the same mixer and AIC model tier. It takes a generic
+        # TransportParams (not DailyParams). No audio_out_10ms_chunks: that knob
+        # is DailyParams-only (virtual-mic pacing); SmallWebRTC/aiortc paces its
+        # own RTP.
+        "webrtc": lambda: TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_in_sample_rate=24000,
+            audio_out_sample_rate=24000,
+            audio_out_mixer=daily_mixer,
+            audio_in_filter=_create_audio_input_filter(
+                configurations, TRANSPORT_TYPE_WEBRTC
             ),
         ),
         "twilio": lambda: FastAPIWebsocketParams(
