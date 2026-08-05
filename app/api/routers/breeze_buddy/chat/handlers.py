@@ -13,7 +13,9 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse
+from pipecat.processors.aggregators.llm_context import LLMContext
 
+from app.ai.voice.agents.breeze_buddy.chat import llm_driver
 from app.ai.voice.agents.breeze_buddy.chat.approvals import (
     WIRE_STATUS_BY_DB_STATUS,
     claim_tool_approval,
@@ -26,6 +28,10 @@ from app.ai.voice.agents.breeze_buddy.chat.client_context import (
     ClientContextTooLarge,
     compute_context_patch,
 )
+from app.ai.voice.agents.breeze_buddy.chat.client_tool_budget import (
+    check_and_consume_step,
+    record_tokens,
+)
 from app.ai.voice.agents.breeze_buddy.chat.client_tool_guard import screen_outcome
 from app.ai.voice.agents.breeze_buddy.chat.metrics import TurnMetrics
 from app.ai.voice.agents.breeze_buddy.chat.sse import SSEEvent, format_sse
@@ -37,6 +43,7 @@ from app.ai.voice.agents.breeze_buddy.chat.turn_core import (
     run_chat_client_tool_continuation,
     run_chat_turn,
 )
+from app.ai.voice.agents.breeze_buddy.llm import get_llm_service
 from app.ai.voice.agents.breeze_buddy.template.cache import get_template_by_id_cached
 from app.ai.voice.agents.breeze_buddy.template.transformation_function import (
     TEMPLATE_FUNCTION_REGISTRY,
@@ -66,6 +73,8 @@ from app.schemas.breeze_buddy.chat import (
     ChatSession,
     ChatSessionStatus,
     ChatTranscriptResponse,
+    ClientInferRequest,
+    ClientInferResponse,
     ClientToolResultRequest,
     CreateChatSessionRequest,
     CreateChatSessionResponse,
@@ -950,6 +959,102 @@ async def client_tool_result_handler(
     finally:
         if not lock_handed_off:
             await lock.release()
+
+
+async def client_infer_handler(
+    session_id: str,
+    req: ClientInferRequest,
+    *,
+    access_check: Optional[Callable[[ChatSession], None]] = None,
+) -> ClientInferResponse:
+    """Stateless inference for the browser subagent.
+
+    Deliberately NOT a chat turn: no session lock, no history load, no
+    persistence, no template render, nothing written to ``chat_message``.
+    The subagent's inner loop is private working memory — folding it into
+    the conversation is exactly what this design avoids, because a dozen
+    stale page snapshots in context is how the outer model starts
+    describing a page state that no longer exists.
+
+    It exists at all because the browser must never hold a provider key,
+    and a merchant's CSP can block a direct call to a model vendor.
+
+    The client is untrusted, so budgets are enforced HERE rather than by
+    the caller's own ``max_steps`` (see ``client_tool_budget``).
+    """
+    session = await get_chat_session_by_id(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Chat session '{session_id}' not found",
+        )
+    if access_check is not None:
+        access_check(session)
+    if session.status == ChatSessionStatus.ENDED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=f"Chat session '{session_id}' has ended",
+        )
+
+    template = await get_template_by_id_cached(session.template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Template no longer exists",
+        )
+
+    # Templates opt in. Without this a widget token would be a general
+    # purpose inference credential for any session on the platform.
+    ct_cfg = template.configurations.client_tools if template.configurations else None
+    if ct_cfg is None or not ct_cfg.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "client_tools_disabled",
+                "message": "This template does not enable client tools.",
+            },
+        )
+
+    verdict = await check_and_consume_step(session_id)
+    if not verdict.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "code": verdict.reason or "budget_exhausted",
+                "message": ("This session has used its client-tool inference budget."),
+                "steps_used": verdict.steps_used,
+                "tokens_used": verdict.tokens_used,
+            },
+        )
+
+    llm = await get_llm_service(resolve_llm_configuration(template), pooled=True)
+    context = LLMContext(
+        messages=[
+            cast(Any, {"role": m.role, "content": m.content}) for m in req.messages
+        ]
+    )
+
+    chunks: List[str] = []
+    async for kind, payload in llm_driver.stream(
+        llm, context, log_label="client-tool-infer"
+    ):
+        # Tool calls are not part of this lane's contract: the subagent
+        # asks for a decision as TEXT and does the acting itself, in the
+        # page. Ignoring them keeps the response shape closed.
+        if kind == "text" and isinstance(payload, str):
+            chunks.append(payload)
+
+    content = "".join(chunks)
+    # Charged after the fact — we cannot know the cost in advance, so the
+    # cap lands on the NEXT call rather than refusing work already done.
+    # ~4 chars/token is the calibration from the POC traces.
+    await record_tokens(session_id, max(1, len(content) // 4))
+
+    return ClientInferResponse(
+        content=content,
+        steps_used=verdict.steps_used,
+        tokens_used=verdict.tokens_used,
+    )
 
 
 async def cancel_chat_turn_handler(session_id: str) -> None:

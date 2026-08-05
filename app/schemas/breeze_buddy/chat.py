@@ -7,7 +7,7 @@ analytics over voice + chat use the same field semantics.
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -123,6 +123,38 @@ class ClientToolOutcome(BaseModel):
             "max_steps | cancelled | ambiguous | error."
         ),
     )
+
+
+class ClientInferMessage(BaseModel):
+    """One message in the browser subagent's own conversation.
+
+    Deliberately minimal — this lane carries the inner loop's private
+    reasoning, which never enters the outer chat history.
+    """
+
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(..., max_length=200_000)
+
+
+class ClientInferRequest(BaseModel):
+    """Body of ``POST .../session/{id}/infer``.
+
+    Stateless inference for the browser subagent: no chat session is read
+    or written, no lock is taken, nothing is persisted. It exists so the
+    in-page loop can reach a model without the page ever holding a
+    provider key (and because a merchant CSP may block a direct call).
+    """
+
+    messages: List[ClientInferMessage] = Field(..., min_length=1, max_length=60)
+    max_tokens: int = Field(1024, ge=1, le=8192)
+
+
+class ClientInferResponse(BaseModel):
+    """Raw completion plus what it cost, so the client can self-pace."""
+
+    content: str
+    steps_used: int
+    tokens_used: int
 
 
 class ClientToolResultRequest(BaseModel):

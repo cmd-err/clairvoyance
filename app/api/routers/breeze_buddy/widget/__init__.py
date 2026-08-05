@@ -6,6 +6,7 @@ Routes under ``/agent/voice/breeze-buddy/widget``:
 - ``POST /widget/session/{id}/message``                 chat turn (SSE)
 - ``POST /widget/session/{id}/cancel``                  cancel in-flight turn
 - ``POST /widget/session/{id}/client-tool-result``      answer a client_tool_call (SSE)
+- ``POST /widget/session/{id}/infer``                   subagent inference (stateless)
 - ``POST /widget/session/{id}/context``                 push state/facts (no LLM turn)
 - ``POST /widget/session/{id}/voice/connect``           open voice attachment
 - ``POST /widget/session/{id}/voice/end``               close voice attachment
@@ -31,6 +32,8 @@ from app.api.security.breeze_buddy.widget_token import (
 )
 from app.schemas.breeze_buddy.chat import (
     ApproveToolRequest,
+    ClientInferRequest,
+    ClientInferResponse,
     ClientToolResultRequest,
     CreateWidgetSessionRequest,
     CreateWidgetSessionResponse,
@@ -47,6 +50,7 @@ from app.schemas.breeze_buddy.chat import (
 from .handlers import (
     approve_widget_tool_handler,
     cancel_widget_message_handler,
+    client_infer_widget_handler,
     client_tool_result_widget_handler,
     create_widget_session_handler,
     end_widget_session_handler,
@@ -98,6 +102,11 @@ async def widget_approval_preflight(session_id: str) -> Response:
 
 @router.options("/session/{session_id}/client-tool-result")
 async def widget_client_tool_result_preflight(session_id: str) -> Response:
+    return options_cors_response()
+
+
+@router.options("/session/{session_id}/infer")
+async def widget_infer_preflight(session_id: str) -> Response:
     return options_cors_response()
 
 
@@ -239,6 +248,29 @@ async def client_tool_result(
     looked like secrets and was refused.
     """
     return await client_tool_result_widget_handler(session_id, req, ctx)
+
+
+@router.post(
+    "/session/{session_id}/infer",
+    response_model=ClientInferResponse,
+    summary="Stateless inference for the browser subagent's inner loop",
+)
+async def client_infer(
+    session_id: str,
+    req: ClientInferRequest,
+    ctx: WidgetSessionContext = Depends(require_widget_session),
+) -> ClientInferResponse:
+    """Run one model call for the in-page subagent.
+
+    NOT a chat turn: no lock, no history, nothing persisted. The inner
+    loop's reasoning is private working memory and never enters the
+    conversation — folding a dozen page snapshots into chat history is
+    what makes a model describe a page state that no longer exists.
+
+    403 ``client_tools_disabled`` when the template has not opted in.
+    429 when the session has spent its inference budget.
+    """
+    return await client_infer_widget_handler(session_id, req, ctx)
 
 
 @router.post(

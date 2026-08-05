@@ -38,6 +38,7 @@ from app.ai.voice.stt import TranscriptionError, transcribe_audio
 from app.api.routers.breeze_buddy.chat.handlers import (
     approve_chat_tool_handler,
     cancel_chat_turn_handler,
+    client_infer_handler,
     client_tool_result_handler,
     create_chat_session_handler,
     end_chat_session_handler,
@@ -89,6 +90,8 @@ from app.schemas.breeze_buddy.chat import (
     ApproveToolRequest,
     ChatMessage,
     ChatSessionStatus,
+    ClientInferRequest,
+    ClientInferResponse,
     ClientToolResultRequest,
     CreateChatSessionRequest,
     CreateWidgetSessionRequest,
@@ -523,6 +526,27 @@ async def client_tool_result_widget_handler(
             detail=f"Widget session '{session_id}' has ended",
         )
     return await client_tool_result_handler(session_id, req, access_check=None)
+
+
+async def client_infer_widget_handler(
+    session_id: str,
+    req: ClientInferRequest,
+    ctx: WidgetSessionContext,
+) -> ClientInferResponse:
+    """Stateless inference for the browser subagent's inner loop.
+
+    Widget-auth shell over the shared chat handler. Ownership is checked
+    here; the template opt-in, the per-session budget and the model call
+    live in ``client_infer_handler``.
+    """
+    session = await get_chat_session_by_id(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Widget session '{session_id}' not found",
+        )
+    assert_widget_session_ownership(session, ctx)
+    return await client_infer_handler(session_id, req, access_check=None)
 
 
 async def cancel_widget_message_handler(
