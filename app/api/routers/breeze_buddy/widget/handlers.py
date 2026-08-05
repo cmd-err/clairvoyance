@@ -38,6 +38,7 @@ from app.ai.voice.stt import TranscriptionError, transcribe_audio
 from app.api.routers.breeze_buddy.chat.handlers import (
     approve_chat_tool_handler,
     cancel_chat_turn_handler,
+    client_tool_result_handler,
     create_chat_session_handler,
     end_chat_session_handler,
     load_chat_session_or_404,
@@ -88,6 +89,7 @@ from app.schemas.breeze_buddy.chat import (
     ApproveToolRequest,
     ChatMessage,
     ChatSessionStatus,
+    ClientToolResultRequest,
     CreateChatSessionRequest,
     CreateWidgetSessionRequest,
     CreateWidgetSessionResponse,
@@ -494,6 +496,33 @@ async def approve_widget_tool_handler(
 # ---------------------------------------------------------------------------
 # POST /widget/session/{id}/cancel
 # ---------------------------------------------------------------------------
+
+
+async def client_tool_result_widget_handler(
+    session_id: str,
+    req: ClientToolResultRequest,
+    ctx: WidgetSessionContext,
+):
+    """Report a browser-executed client tool's outcome; stream the resumed turn.
+
+    Thin widget-auth shell over the shared chat handler (same shape as
+    ``approve_widget_tool_handler``). Ownership is enforced here; the chat
+    handler owns the lock, the secret screening, the tool_result write and
+    the resume.
+    """
+    session = await get_chat_session_by_id(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Widget session '{session_id}' not found",
+        )
+    assert_widget_session_ownership(session, ctx)
+    if session.status == ChatSessionStatus.ENDED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=f"Widget session '{session_id}' has ended",
+        )
+    return await client_tool_result_handler(session_id, req, access_check=None)
 
 
 async def cancel_widget_message_handler(

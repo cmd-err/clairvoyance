@@ -127,6 +127,117 @@ def _partition_gated_calls(
     return gated, ungated
 
 
+def _partition_client_calls(
+    tool_calls: List[Any],
+    client_tool_names: Set[str],
+    node: Dict[str, Any],
+) -> Tuple[List[Any], List[Any]]:
+    """Split a tool-call batch into (browser-executed, server-executed).
+
+    Client tools are performed by the embedded widget against the merchant's
+    live page, so they can't run through ``_dispatch_tool_call`` — the turn
+    ends and the browser answers on
+    ``POST /widget/session/{id}/client-tool-result``.
+
+    Node shadowing matches :func:`_partition_gated_calls`: a per-node
+    function whose name collides with a client tool wins in that node and
+    stays server-side, so a template author can always override.
+
+    CALLER ORDERING IS LOAD-BEARING — partition gated calls FIRST and pass
+    only the ungated remainder here. A client tool the template also gates
+    must reach the approval path; handing it to the browser would perform an
+    action the user never confirmed.
+    """
+    node_fn_names = {
+        fn.name
+        for fn in (node.get("functions") or [])
+        if isinstance(fn, FlowsFunctionSchema)
+    }
+    client = [
+        c
+        for c in tool_calls
+        if c.function_name in client_tool_names and c.function_name not in node_fn_names
+    ]
+    server = [
+        c
+        for c in tool_calls
+        if c.function_name not in client_tool_names or c.function_name in node_fn_names
+    ]
+    return client, server
+
+
+# LLM-visible schemas for browser-executed tools. Descriptions are doing
+# real work here: `perform_page_task` explicitly tells the model to hand
+# over the WHOLE goal, because decomposing it into per-action calls costs a
+# full LLM turn per DOM action and is the latency failure this design exists
+# to avoid.
+_CLIENT_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
+    "read_page": {
+        "description": (
+            "Read the user's current page: its interactive elements and "
+            "visible text, including any status or error messages. Returns "
+            "the page AS IT IS RIGHT NOW — cheap to call again after "
+            "something changes. Use this to ANSWER questions about the page; "
+            "use perform_page_task to CHANGE it."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    "perform_page_task": {
+        "description": (
+            "Do a task on the user's current page — fill fields, choose "
+            "options, click through a flow. Give the COMPLETE goal in one "
+            "call, in plain English; it runs its own look/act/verify loop in "
+            "the browser and returns when finished. Do NOT break the task "
+            "into separate calls. It stops and asks first before anything "
+            "irreversible (payment, deletion, final submit)."
+        ),
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": (
+                    "The whole task, e.g. 'register the Trailhead 40L "
+                    "with email deepa@example.com'."
+                ),
+            },
+            "success_criteria": {
+                "type": "string",
+                "description": (
+                    "Optional. How to tell it worked, e.g. 'a confirmation "
+                    "message appears'."
+                ),
+            },
+        },
+        "required": ["goal"],
+    },
+}
+
+
+async def _client_tool_unreachable(_args: Dict[str, Any], _flow_manager: Any) -> Any:
+    """Handler for client tools — must never run.
+
+    Client calls are split out by :func:`_partition_client_calls` before
+    dispatch. Reaching here means that routing regressed and the call would
+    otherwise silently no-op, so fail loudly instead.
+    """
+    raise RuntimeError(
+        "client tool reached _dispatch_tool_call — _partition_client_calls "
+        "routing is broken"
+    )
+
+
+def _client_tool_schema(name: str) -> FlowsFunctionSchema:
+    """Build the LLM-visible schema for one client tool."""
+    spec = _CLIENT_TOOL_SPECS[name]
+    return FlowsFunctionSchema(
+        name=name,
+        description=spec["description"],
+        properties=spec["properties"],
+        required=spec["required"],
+        handler=_client_tool_unreachable,
+    )
+
+
 @dataclass
 class _PreparedTools:
     """Per-turn tool surface shared by ``run_turn`` and ``run_approval_turn``."""
@@ -250,6 +361,18 @@ class ChatAgent:
         self.handles_state_externally = True
         # function name -> ApprovalConfig for every gated global function.
         self._approval_map = build_approval_map(self.template.flow or {})
+        # Browser-executed tools this template opted into. The CONFIGURED
+        # set; ``_active_client_tools`` (computed in _prepare_tools, after
+        # name-collision resolution) is what the partition actually reads.
+        ct_cfg = (
+            self.template.configurations.client_tools
+            if self.template.configurations
+            else None
+        )
+        self._client_tool_names: Set[str] = (
+            set(ct_cfg.tools) if ct_cfg and ct_cfg.enabled else set()
+        )
+        self._active_client_tools: Set[str] = set()
 
     async def run_turn(
         self,
@@ -440,6 +563,32 @@ class ChatAgent:
                             "dropped on a name collision with an existing "
                             "function; it will NOT be approval-gated."
                         )
+
+        # Browser-executed tools. Appended last so a same-named flow/MCP
+        # function always wins — the merchant's own tool beats ours. These
+        # carry a handler that raises: client calls are partitioned out
+        # before dispatch (_partition_client_calls), so reaching
+        # _dispatch_tool_call means that routing broke and we want it loud.
+        #
+        # ``_active_client_tools`` (NOT the configured set) is what the
+        # partition reads. A name we dropped on collision must not stay in
+        # it: the surviving same-named function is the MERCHANT's, and
+        # routing that to the browser would dispatch someone else's tool as
+        # a page action. Global collisions aren't covered by the partition's
+        # node-shadow rule, so they have to be resolved here.
+        self._active_client_tools = set()
+        if self._client_tool_names:
+            existing = {fn.name for fn in global_funcs}
+            for name in sorted(self._client_tool_names):
+                if name in existing:
+                    logger.warning(
+                        f"[client_tools] '{name}' collides with an existing "
+                        "function; the existing one wins and the client tool "
+                        "will NOT be exposed or routed to the browser."
+                    )
+                    continue
+                global_funcs.append(_client_tool_schema(name))
+                self._active_client_tools.add(name)
 
         # Aggregate per-tool context-retention policy across every MCP server
         # the template declares. Used by llm_driver to compact stale
@@ -637,6 +786,14 @@ class ChatAgent:
             gated_calls, ungated_calls = _partition_gated_calls(
                 tool_calls, self._approval_map, node
             )
+            # Browser-executed calls come out of the UNGATED remainder, so a
+            # client tool the template also gates still reaches the approval
+            # path rather than being performed unconfirmed. Reads
+            # _active_client_tools (post name-collision resolution), never
+            # the raw configured set.
+            client_calls, ungated_calls = _partition_client_calls(
+                ungated_calls, self._active_client_tools, node
+            )
 
             next_node: Optional[Dict[str, Any]] = None
             tool_result_pairs: List[Tuple[str, Any]] = []
@@ -778,6 +935,56 @@ class ChatAgent:
                         "assistant_idx": gate_assistant_idx,
                         "awaiting_approval": True,
                         "pending_tool_call_ids": pending_ids,
+                    },
+                )
+                return
+
+            if client_calls:
+                # Browser-executed calls. Placed AFTER the gate branch so a
+                # batch carrying both ends at the approval gate first — the
+                # client calls then dangle and are healed by
+                # repair_dangling_tool_uses on the next turn. Confirming a
+                # risky action always outranks convenience.
+                #
+                # Nothing is dispatched here and no pending row is written:
+                # the assistant row carrying these tool_use blocks is already
+                # persisted above, and THAT unanswered tool_use *is* the
+                # pending state. The browser answers on
+                # POST .../session/{id}/client-tool-result, which writes the
+                # tool_result row and resumes the turn. If it never answers,
+                # repair_dangling_tool_uses injects a synthetic error result
+                # on the next turn — which is why this path needs no timeout,
+                # no expiry sweeper and no bookkeeping table.
+                #
+                # The turn ends here, so the session lock is RELEASED while
+                # the browser works. A slow page task can never exhaust the
+                # lock TTL.
+                for call in client_calls:
+                    yield SSEEvent(
+                        event="client_tool_call",
+                        data={
+                            "tool_call_id": call.tool_call_id,
+                            "name": call.function_name,
+                            "args": dict(call.arguments),
+                        },
+                    )
+
+                await update_chat_session_after_turn(
+                    session_id=self.session_id, current_node=node_name or None
+                )
+                # Drain any held marker carry (mirrors the gate + normal ends).
+                for out in self._ui_extractor.flush():
+                    if isinstance(out, TextOut):
+                        yield SSEEvent(
+                            event="assistant_token", data={"delta": out.value}
+                        )
+                yield SSEEvent(
+                    event="turn_end",
+                    data={
+                        "session_status": "ACTIVE",
+                        "assistant_idx": gate_assistant_idx,
+                        "awaiting_client_tool": True,
+                        "pending_tool_call_ids": [c.tool_call_id for c in client_calls],
                     },
                 )
                 return
@@ -1097,6 +1304,57 @@ class ChatAgent:
                 },
             )
             return
+
+        async for event in self._cycle_loop(context, node, prep):
+            yield event
+
+    async def run_client_tool_turn(
+        self,
+        *,
+        tool_call_id: str,
+        function_name: str,
+        outcome: Dict[str, Any],
+        history: List[Dict[str, Any]],
+        current_node: Optional[str],
+    ) -> AsyncIterator[SSEEvent]:
+        """Resume a turn that ended awaiting a browser-executed client tool.
+
+        Simpler than :meth:`run_approval_turn` because there is nothing to
+        execute: the browser already did the work, and the caller has
+        ALREADY persisted its ``outcome`` as a tool_result row under the
+        session lock, BEFORE loading ``history``. So the replayed history
+        arrives fully paired and we only have to continue the LLM loop.
+
+        That ordering is the whole trick — it is why this path needs no
+        pending-row table, no timeout and no cross-pod signalling: the
+        unanswered ``tool_use`` was the pending state, and writing its
+        answer is what makes the conversation replayable again.
+        """
+        prep = await self._prepare_tools()
+        node = self._resolve_node(prep.flow_config, current_node)
+        node_name = cast(str, node["name"])
+        # Same rationale as the approval resume: no new user utterance to
+        # retrieve on, and the history tail is tool_use/tool_result where
+        # extra messages break provider adapters.
+        kb_message = await self._prepare_kb_message_for_resume()
+        context = self._seed_resume_context(
+            node, history, prep.global_funcs, kb_message=kb_message
+        )
+
+        # Mirrors the server-side dispatch path so the widget settles its
+        # activity indicator off the same event either way.
+        yield SSEEvent(
+            event="function_call_completed",
+            data={
+                "name": function_name,
+                "tool_call_id": tool_call_id,
+                "result_summary": _summarize_result(outcome),
+            },
+        )
+
+        await update_chat_session_after_turn(
+            session_id=self.session_id, current_node=node_name or None
+        )
 
         async for event in self._cycle_loop(context, node, prep):
             yield event

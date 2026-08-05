@@ -95,6 +95,48 @@ class ApproveToolRequest(BaseModel):
     )
 
 
+class ClientToolOutcome(BaseModel):
+    """What the browser reports after performing a client tool.
+
+    Deliberately small and structured. The LLM must learn *whether it
+    worked* and *what the page looks like now* — never a raw dump of page
+    prose, which is an injection channel wearing a helpful hat.
+    """
+
+    ok: bool = Field(..., description="Did the task achieve its goal?")
+    steps_completed: int = Field(0, ge=0, le=100)
+    what_changed: List[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description="Short human-readable descriptions of observed changes.",
+    )
+    page_digest: Optional[str] = Field(
+        None,
+        max_length=2000,
+        description="Compact description of the page AFTER the task.",
+    )
+    aborted_reason: Optional[str] = Field(
+        None,
+        max_length=200,
+        description=(
+            "Why the loop stopped early: needs_approval | navigated | "
+            "max_steps | cancelled | ambiguous | error."
+        ),
+    )
+
+
+class ClientToolResultRequest(BaseModel):
+    """Body of ``POST .../session/{id}/client-tool-result``.
+
+    The browser's answer to a ``client_tool_call``. Writing it as a
+    ``tool_result`` block is what makes the paused turn's history
+    replayable again, which is what allows the turn to resume.
+    """
+
+    tool_call_id: str = Field(..., min_length=1, max_length=128)
+    outcome: ClientToolOutcome
+
+
 class ChatSession(BaseModel):
     """One row of `chat_session`.
 

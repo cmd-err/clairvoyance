@@ -14,6 +14,7 @@ from pydantic import (
     StringConstraints,
     ValidationInfo,
     field_serializer,
+    field_validator,
     model_validator,
 )
 
@@ -1468,6 +1469,83 @@ class ClientContextConfig(BaseModel):
     )
 
 
+# Client tools the LLM may be offered. ``act_on_page`` is deliberately
+# absent: it is an internal primitive the browser subagent drives, and
+# exposing it invites the outer LLM to micromanage the page step by step
+# (read → act → read …), which costs a full LLM turn per DOM action. The
+# whole point of ``perform_page_task`` is that the loop runs in the browser.
+EXPOSABLE_CLIENT_TOOLS: frozenset[str] = frozenset({"read_page", "perform_page_task"})
+
+
+class ClientToolsConfig(BaseModel):
+    """Per-template opt-in for browser-executed ("client") tools.
+
+    A client tool is dispatched to the embedded widget instead of running
+    server-side: the LLM emits the call, the turn ends, the browser performs
+    it against the merchant's live page, and the result arrives on
+    ``POST /widget/session/{id}/client-tool-result`` — which resumes the
+    turn. Mechanically this is HITL Pattern B with a browser on the far end
+    instead of a human, so it reuses the same end-turn/resume machinery and
+    the same dangling-tool_use repair.
+
+    Inert by default: with ``enabled=False`` (or an empty ``tools``) nothing
+    is advertised to the LLM, so an untouched template is unaffected.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch. False = no client tool is advertised, whatever "
+            "`tools` contains."
+        ),
+    )
+    tools: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Which client tools this template exposes. `read_page` for "
+            "pure reading; `perform_page_task` for multi-step work (the "
+            "browser runs its own loop and returns one outcome). Empty = "
+            "feature inert."
+        ),
+    )
+    max_steps: int = Field(
+        default=8,
+        ge=1,
+        le=30,
+        description=(
+            "Hard cap on browser-side loop iterations for one "
+            "`perform_page_task`. Bounds a runaway loop on a merchant's page."
+        ),
+    )
+    inner_model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Model the browser subagent's inner loop uses. None = backend "
+            "default. Intentionally separate from the conversational model: "
+            "the inner loop wants fast and cheap, not strong."
+        ),
+    )
+    origin_allowlist: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Origins the agent may navigate to. Empty = same-origin only. "
+            "The exfiltration choke point — a destination allowlist is "
+            "deterministic where content inspection is not."
+        ),
+    )
+
+    @field_validator("tools")
+    @classmethod
+    def _validate_tools(cls, v: List[str]) -> List[str]:
+        unknown = [t for t in v if t not in EXPOSABLE_CLIENT_TOOLS]
+        if unknown:
+            raise ValueError(
+                f"unknown or non-exposable client tools: {sorted(unknown)}. "
+                f"Allowed: {sorted(EXPOSABLE_CLIENT_TOOLS)}"
+            )
+        return v
+
+
 class KnowledgeBaseMode(str, Enum):
     """How attached knowledge bases reach the LLM at runtime."""
 
@@ -1614,6 +1692,15 @@ class ConfigurationModel(BaseModel):
             "which state/facts keys the embed may write, caps facts size, "
             "and chooses how facts render (data vs. instructions). Absent / "
             "empty allowlists = feature inert."
+        ),
+    )
+    client_tools: Optional["ClientToolsConfig"] = Field(
+        None,
+        description=(
+            "Optional. Browser-executed tools — lets the agent read and act "
+            "on the merchant's live page. The LLM emits the call, the turn "
+            "ends, the widget performs it, and the result resumes the turn "
+            "(same machinery as HITL approval). Absent / disabled = inert."
         ),
     )
 

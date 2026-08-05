@@ -299,6 +299,116 @@ async def run_chat_approval_continuation(
         yield event
 
 
+def find_pending_client_tool(
+    history_rows: List[Any], tool_call_id: str
+) -> Optional[str]:
+    """Return the function name of an UNANSWERED ``tool_call_id``, else None.
+
+    The unanswered ``tool_use`` block is the entire pending state for a
+    browser-executed tool — there is no pending-row table — so this is both
+    the existence check and the idempotency guard:
+
+    - no matching ``tool_use``            → unknown call     (409)
+    - a matching ``tool_result`` exists   → already answered (409)
+    - matching ``tool_use``, no result    → the name to resume with
+
+    Pure function over already-loaded rows, so the endpoint pays no extra
+    DB round trip and the policy is unit-testable without a database.
+    """
+    declared: Optional[str] = None
+    for row in history_rows:
+        for block in row.content_blocks or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "tool_use" and block.get("id") == tool_call_id:
+                declared = str(block.get("name") or "")
+            elif btype == "tool_result" and block.get("tool_use_id") == tool_call_id:
+                return None  # already answered
+    return declared
+
+
+async def run_chat_client_tool_continuation(
+    *,
+    session_id: str,
+    tool_call_id: str,
+    function_name: str,
+    outcome: Dict[str, Any],
+    llm: Optional[Any] = None,
+) -> AsyncIterator[SSEEvent]:
+    """Drive the resume turn after the browser reports a client-tool outcome.
+
+    The caller has ALREADY persisted ``outcome`` as a ``tool_result`` row
+    under the session lock, before this runs — so the history loaded here is
+    fully paired and can be replayed straight back to the LLM. That write is
+    what "resolves" the pending state; nothing else is claimed or swept.
+
+    Mirrors :func:`run_chat_approval_continuation`, minus the claim and the
+    execution: the work already happened in the browser.
+    """
+    session = await get_chat_session_by_id(session_id)
+    if session is None or session.status == ChatSessionStatus.ENDED:
+        yield SSEEvent(
+            event="error",
+            data={"code": "session_gone", "message": "Session no longer active"},
+        )
+        yield SSEEvent(event="turn_end", data={"session_status": "FAILED"})
+        return
+    template = await get_template_by_id_cached(session.template_id)
+    if template is None:
+        yield SSEEvent(
+            event="error",
+            data={"code": "template_missing", "message": "Template missing"},
+        )
+        yield SSEEvent(event="turn_end", data={"session_status": "FAILED"})
+        return
+
+    history_limit = await CHAT_HISTORY_REPLAY_LIMIT()
+    history_rows = await list_chat_messages_for_session(session_id, limit=history_limit)
+    history: list = blocks_to_llm_context_messages(
+        [
+            {
+                "role": row.role.value,
+                "content": row.content,
+                "content_blocks": row.content_blocks,
+            }
+            for row in history_rows
+            if row.role in (ChatMessageRole.USER, ChatMessageRole.ASSISTANT)
+        ]
+    )
+    # No exclude_ids: our own call is already answered (the caller wrote the
+    # row). Anything else still dangling is genuinely lost and should be
+    # healed to a synthetic error rather than replayed unanswered.
+    history = cast(list, repair_dangling_tool_uses(history))
+
+    state_row = await get_agent_session_state(session_id)
+    agent_state: Dict[str, Any] = state_row.data if state_row else {}
+    persisted_template_vars = (
+        session.metadata.get("template_vars", {})
+        if isinstance(session.metadata, dict)
+        else {}
+    )
+    template_vars = await build_render_template_vars(template, persisted_template_vars)
+    if llm is None:
+        llm = await get_llm_service(resolve_llm_configuration(template), pooled=True)
+
+    agent = ChatAgent(
+        session_id=session_id,
+        template=template,
+        llm=llm,
+        template_vars=template_vars,
+        agent_state=agent_state,
+    )
+    async for event in agent.run_client_tool_turn(
+        tool_call_id=tool_call_id,
+        function_name=function_name,
+        outcome=outcome,
+        history=history,
+        current_node=session.current_node,
+    ):
+        yield event
+
+
 async def run_chat_approval_turn(
     *,
     session_id: str,

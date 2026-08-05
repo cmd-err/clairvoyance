@@ -20,17 +20,21 @@ from app.ai.voice.agents.breeze_buddy.chat.approvals import (
 )
 from app.ai.voice.agents.breeze_buddy.chat.block_codec import (
     filter_visible_blocks,
+    tool_results_to_user_blocks,
 )
 from app.ai.voice.agents.breeze_buddy.chat.client_context import (
     ClientContextTooLarge,
     compute_context_patch,
 )
+from app.ai.voice.agents.breeze_buddy.chat.client_tool_guard import screen_outcome
 from app.ai.voice.agents.breeze_buddy.chat.metrics import TurnMetrics
 from app.ai.voice.agents.breeze_buddy.chat.sse import SSEEvent, format_sse
 from app.ai.voice.agents.breeze_buddy.chat.turn_core import (
     build_render_template_vars,
+    find_pending_client_tool,
     resolve_llm_configuration,
     run_chat_approval_continuation,
+    run_chat_client_tool_continuation,
     run_chat_turn,
 )
 from app.ai.voice.agents.breeze_buddy.template.cache import get_template_by_id_cached
@@ -39,6 +43,7 @@ from app.ai.voice.agents.breeze_buddy.template.transformation_function import (
 )
 from app.ai.voice.agents.breeze_buddy.template.types import TemplateModel
 from app.api.routers.breeze_buddy.analytics.rbac import apply_hierarchical_filters
+from app.core.config.dynamic import CHAT_HISTORY_REPLAY_LIMIT
 from app.core.logger import logger
 from app.database.accessor.breeze_buddy.chat_session import (
     count_chat_sessions,
@@ -61,6 +66,7 @@ from app.schemas.breeze_buddy.chat import (
     ChatSession,
     ChatSessionStatus,
     ChatTranscriptResponse,
+    ClientToolResultRequest,
     CreateChatSessionRequest,
     CreateChatSessionResponse,
     EndChatSessionResponse,
@@ -781,6 +787,156 @@ async def approve_chat_tool_handler(
                     pending_sibling_ids=claim.pending_sibling_ids,
                 ),
                 pre_events=pre_events,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+        lock_handed_off = True
+        return response
+    finally:
+        if not lock_handed_off:
+            await lock.release()
+
+
+async def client_tool_result_handler(
+    session_id: str,
+    req: ClientToolResultRequest,
+    *,
+    access_check: Optional[Callable[[ChatSession], None]] = None,
+) -> StreamingResponse:
+    """Accept a browser-executed tool's outcome and stream the resumed turn.
+
+    The counterpart to the ``client_tool_call`` SSE event: that turn ended
+    with an unanswered ``tool_use`` and released the lock, so the browser
+    could work for as long as it needed. Writing its answer here is what
+    makes the replayed history valid again and lets the LLM continue.
+
+    Order is load-bearing:
+    1. Take the lock — serialises against ``/message`` and ``/approval``.
+    2. Screen the outcome for secrets. The browser is untrusted; its claim
+       that it redacted is not evidence, so we re-check server-side BEFORE
+       anything is persisted or reaches the LLM.
+    3. Resolve the pending call from history. The unanswered ``tool_use`` IS
+       the pending state (no bookkeeping table), so this one lookup is both
+       the existence check and the idempotency guard.
+    4. Persist the ``tool_result`` row, THEN stream — the continuation
+       re-reads history and must see a fully-answered batch.
+
+    Deliberately absent: any timeout or expiry handling. If the browser
+    never calls this, the dangling ``tool_use`` is healed by
+    ``repair_dangling_tool_uses`` on the session's next turn.
+    """
+    lock = RedisLock(_lock_key(session_id), ttl_seconds=_SESSION_LOCK_TTL_SECONDS)
+    try:
+        await lock.acquire()
+    except LockAcquireError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "lock_contended",
+                "message": (
+                    "Another turn is already in flight for this session. "
+                    "Wait for it to complete and retry."
+                ),
+            },
+        )
+
+    lock_handed_off = False
+    try:
+        fresh = await get_chat_session_by_id(session_id)
+        if fresh is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chat session '{session_id}' not found",
+            )
+        if access_check is not None:
+            access_check(fresh)
+        if fresh.status == ChatSessionStatus.ENDED:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail=f"Chat session '{session_id}' has ended",
+            )
+
+        template = await get_template_by_id_cached(fresh.template_id)
+        if template is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    f"Template '{fresh.template_id}' for chat session "
+                    f"'{session_id}' no longer exists"
+                ),
+            )
+
+        outcome_payload = req.outcome.model_dump(exclude_none=True)
+        violations = screen_outcome(outcome_payload)
+        if violations:
+            # Log the KIND and LOCATION only — never the matched value.
+            logger.error(
+                f"[client_tools] rejected outcome for session={session_id} "
+                f"tool_call_id={req.tool_call_id}: {violations}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "sensitive_content",
+                    "message": (
+                        "The reported outcome contained values that look "
+                        "sensitive and was rejected."
+                    ),
+                    "violations": violations,
+                },
+            )
+
+        history_limit = await CHAT_HISTORY_REPLAY_LIMIT()
+        history_rows = await list_chat_messages_for_session(
+            session_id, limit=history_limit
+        )
+        function_name = find_pending_client_tool(history_rows, req.tool_call_id)
+        if not function_name:
+            # Either never declared, or already answered — including the
+            # case where the user moved on and the next turn healed it.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "not_pending",
+                    "message": (
+                        "No unanswered client tool call with that id — it was "
+                        "already answered, or the turn moved on."
+                    ),
+                },
+            )
+
+        # THE write that resolves the pending state. Everything downstream
+        # (history replay, provider validity) depends on this landing first.
+        await insert_chat_message(
+            session_id=session_id,
+            role=ChatMessageRole.USER,
+            content=None,
+            content_blocks=tool_results_to_user_blocks(
+                [(req.tool_call_id, outcome_payload)]
+            ),
+        )
+
+        turn_metrics = TurnMetrics(
+            session_id=session_id,
+            template_id=template.id,
+            t0=time.monotonic(),
+        )
+        response = StreamingResponse(
+            _turn_sse_stream(
+                session_id=session_id,
+                lock=lock,
+                turn_metrics=turn_metrics,
+                events=run_chat_client_tool_continuation(
+                    session_id=session_id,
+                    tool_call_id=req.tool_call_id,
+                    function_name=function_name,
+                    outcome=outcome_payload,
+                ),
             ),
             media_type="text/event-stream",
             headers={

@@ -5,6 +5,7 @@ Routes under ``/agent/voice/breeze-buddy/widget``:
 - ``POST /widget/session``                              create
 - ``POST /widget/session/{id}/message``                 chat turn (SSE)
 - ``POST /widget/session/{id}/cancel``                  cancel in-flight turn
+- ``POST /widget/session/{id}/client-tool-result``      answer a client_tool_call (SSE)
 - ``POST /widget/session/{id}/context``                 push state/facts (no LLM turn)
 - ``POST /widget/session/{id}/voice/connect``           open voice attachment
 - ``POST /widget/session/{id}/voice/end``               close voice attachment
@@ -30,6 +31,7 @@ from app.api.security.breeze_buddy.widget_token import (
 )
 from app.schemas.breeze_buddy.chat import (
     ApproveToolRequest,
+    ClientToolResultRequest,
     CreateWidgetSessionRequest,
     CreateWidgetSessionResponse,
     EndChatSessionResponse,
@@ -45,6 +47,7 @@ from app.schemas.breeze_buddy.chat import (
 from .handlers import (
     approve_widget_tool_handler,
     cancel_widget_message_handler,
+    client_tool_result_widget_handler,
     create_widget_session_handler,
     end_widget_session_handler,
     get_widget_session_state_handler,
@@ -90,6 +93,11 @@ async def widget_cancel_preflight(session_id: str) -> Response:
 
 @router.options("/session/{session_id}/approval")
 async def widget_approval_preflight(session_id: str) -> Response:
+    return options_cors_response()
+
+
+@router.options("/session/{session_id}/client-tool-result")
+async def widget_client_tool_result_preflight(session_id: str) -> Response:
     return options_cors_response()
 
 
@@ -206,6 +214,31 @@ async def approve_widget_tool(
     ``lock_contended`` | ``voice_live``.
     """
     return await approve_widget_tool_handler(session_id, req, request, ctx)
+
+
+@router.post(
+    "/session/{session_id}/client-tool-result",
+    summary="Report a browser-executed client tool's outcome (streams the resumed turn)",
+)
+async def client_tool_result(
+    session_id: str,
+    req: ClientToolResultRequest,
+    ctx: WidgetSessionContext = Depends(require_widget_session),
+):
+    """Answer a pending ``client_tool_call`` and resume the turn.
+
+    The turn that requested it ended with ``turn_end
+    {awaiting_client_tool: true}`` and released the session lock, so the
+    browser had unbounded time to work. Posting the outcome here writes the
+    ``tool_result`` that makes the conversation replayable and streams the
+    rest of the assistant's answer as SSE (same shape as ``/message``).
+
+    409 carries a machine-readable ``detail.code``: ``not_pending`` (already
+    answered, or the turn moved on) | ``lock_contended``. 422 with
+    ``sensitive_content`` means the reported outcome contained values that
+    looked like secrets and was refused.
+    """
+    return await client_tool_result_widget_handler(session_id, req, ctx)
 
 
 @router.post(
