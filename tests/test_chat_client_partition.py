@@ -138,3 +138,50 @@ class TestGateBeforeClientOrdering:
         assert [c.function_name for c in gated] == ["issue_refund"]
         assert [c.function_name for c in client] == ["perform_page_task"]
         assert [c.function_name for c in server] == ["search_products"]
+
+
+class TestConfirmedCallsAreGated:
+    """A client call carrying ``confirmed: true`` must reach the approval
+    queue, never the browser.
+
+    This is the path that makes irreversible page actions possible at all —
+    delete a member, pay, submit a form. Before it existed the browser
+    refused those steps and nothing could say yes, so the tasks were dead
+    ends. The flag is what a human approved; if it could skip the gate, the
+    agent could delete things on its own say-so.
+    """
+
+    def _call(self, name, **args):
+        return SimpleNamespace(function_name=name, arguments=args)
+
+    def test_confirmed_client_call_is_not_handed_to_the_browser(self):
+        node = {"functions": []}
+        calls = [self._call("perform_page_task", goal="delete dummy", confirmed=True)]
+
+        _, ungated = _partition_gated_calls(calls, {}, node)
+        client, _server = _partition_client_calls(ungated, {"perform_page_task"}, node)
+        confirmed = [c for c in client if bool(dict(c.arguments).get("confirmed"))]
+
+        assert confirmed, "a confirmed call must be recognised as needing approval"
+
+    def test_an_ordinary_page_task_is_NOT_gated(self):
+        """Gating every page task would make the feature unusable — only the
+        confirmed retry is consequential."""
+        node = {"functions": []}
+        calls = [self._call("perform_page_task", goal="switch to dark mode")]
+
+        _, ungated = _partition_gated_calls(calls, {}, node)
+        client, _server = _partition_client_calls(ungated, {"perform_page_task"}, node)
+        confirmed = [c for c in client if bool(dict(c.arguments).get("confirmed"))]
+
+        assert client, "an ordinary task still goes to the browser"
+        assert not confirmed
+
+    def test_confirmed_false_is_not_treated_as_approval(self):
+        node = {"functions": []}
+        calls = [self._call("perform_page_task", goal="x", confirmed=False)]
+
+        _, ungated = _partition_gated_calls(calls, {}, node)
+        client, _server = _partition_client_calls(ungated, {"perform_page_task"}, node)
+
+        assert not [c for c in client if bool(dict(c.arguments).get("confirmed"))]

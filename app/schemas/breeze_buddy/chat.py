@@ -604,6 +604,17 @@ class CreateWidgetSessionResponse(BaseModel):
             "only when True; the server stays the enforcement point."
         ),
     )
+    client_tools_require_confirmation: bool = Field(
+        False,
+        description=(
+            "Whether irreversible client-tool page actions (pay / delete / "
+            "final submit) must be confirmed by the user before the browser "
+            "executes them. Mirrors the template's "
+            "configurations.client_tools.require_confirmation. Default FALSE — "
+            "no in-widget approval sheet exists yet, so a merchant turns this "
+            "on only once that surface ships."
+        ),
+    )
 
 
 class UpdateWidgetContextRequest(ClientContextPatch):

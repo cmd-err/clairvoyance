@@ -56,6 +56,7 @@ from app.ai.voice.agents.breeze_buddy.services.knowledge_base import (
     resolve_kb_runtime,
 )
 from app.ai.voice.agents.breeze_buddy.template.approval import build_approval_map
+from app.ai.voice.agents.breeze_buddy.template.types import ApprovalConfig
 from app.ai.voice.agents.breeze_buddy.template.builder import FlowConfigBuilder
 from app.ai.voice.agents.breeze_buddy.template.context import with_context
 from app.ai.voice.agents.breeze_buddy.template.session_state import (
@@ -227,6 +228,18 @@ _CLIENT_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 "description": (
                     "Optional. How to tell it worked, e.g. 'a confirmation "
                     "message appears'."
+                ),
+            },
+            "confirmed": {
+                "type": "boolean",
+                "description": (
+                    "Set true ONLY to retry a task that came back with "
+                    "aborted_reason 'needs_approval' — it means the user has "
+                    "asked for the irreversible step (delete, pay, final "
+                    "submit) to go ahead. It shows them a confirmation card "
+                    "first, so you never need to ask in chat yourself: just "
+                    "call again with confirmed=true and let them decide on "
+                    "the card. Never set it on a first attempt."
                 ),
             },
         },
@@ -816,6 +829,21 @@ class ChatAgent:
             client_calls, ungated_calls = _partition_client_calls(
                 ungated_calls, self._active_client_tools, node
             )
+            # A client call carrying `confirmed: true` is the model asking to
+            # take a step the browser already refused as irreversible — a
+            # delete, a payment, a final submit. That needs a human, so it
+            # joins the approval queue instead of going straight to the page.
+            #
+            # Gating on the ARGUMENT rather than the tool name is deliberate:
+            # the same tool is safe by default and only becomes consequential
+            # when it carries this flag, so a name-keyed gate would either
+            # stop every page task or none of them.
+            confirmed_calls = [
+                c for c in client_calls if bool(dict(c.arguments).get("confirmed"))
+            ]
+            if confirmed_calls:
+                client_calls = [c for c in client_calls if c not in confirmed_calls]
+                gated_calls = gated_calls + confirmed_calls
 
             next_node: Optional[Dict[str, Any]] = None
             tool_result_pairs: List[Tuple[str, Any]] = []
@@ -906,7 +934,18 @@ class ChatAgent:
                 # the decision arrives on POST .../session/{id}/approval.
                 pending_ids: List[str] = []
                 for call in gated_calls:
-                    approval_cfg = self._approval_map[call.function_name]
+                    # A confirmed client call has no template-authored config
+                    # — it is gated by the argument, not by the tool name (see
+                    # the partition above) — so it gets a default one whose
+                    # prompt is the goal the user is being asked to approve.
+                    approval_cfg = self._approval_map.get(
+                        call.function_name
+                    ) or ApprovalConfig(
+                        prompt=str(
+                            dict(call.arguments).get("goal")
+                            or f"Allow Buddy Assist to {call.function_name}?"
+                        )
+                    )
                     # Inject NOW so the persisted row holds exactly the
                     # arguments that will run on approval (idempotency hash
                     # bakes in this turn's id — resume replays it verbatim).
@@ -1186,6 +1225,38 @@ class ChatAgent:
         )
 
         transition_node: Optional[Dict[str, Any]] = None
+        # An approved CLIENT tool cannot be dispatched here: the work happens
+        # in the browser, not in this process. Hand it back out over SSE and
+        # end the turn again, exactly as the ungated client path does — the
+        # widget answers on .../client-tool-result and the turn resumes from
+        # there. Without this branch an approved page action would reach
+        # _dispatch_tool_call and hit the guard stub, so confirming was
+        # impossible and every irreversible step was a dead end.
+        if approved and approval.function_name in self._active_client_tools:
+            yield SSEEvent(
+                event="client_tool_call",
+                data={
+                    "tool_call_id": approval.tool_call_id,
+                    "name": approval.function_name,
+                    # The stored args already carry confirmed=true — they are
+                    # what the user saw on the card and approved verbatim.
+                    "args": dict(approval.arguments),
+                },
+            )
+            await update_chat_session_after_turn(
+                session_id=self.session_id, current_node=node_name or None
+            )
+            yield SSEEvent(
+                event="turn_end",
+                data={
+                    "session_status": "ACTIVE",
+                    "assistant_idx": None,
+                    "awaiting_client_tool": True,
+                    "pending_tool_call_ids": [approval.tool_call_id],
+                },
+            )
+            return
+
         if approved:
             call = FunctionCallFromLLM(
                 function_name=approval.function_name,

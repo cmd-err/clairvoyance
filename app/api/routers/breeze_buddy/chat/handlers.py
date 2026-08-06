@@ -9,7 +9,7 @@ stay thin: validate auth, then delegate.
 import asyncio
 import time
 from datetime import datetime
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, cast
 
 from fastapi import HTTPException, status
 from fastapi.responses import StreamingResponse

@@ -202,6 +202,19 @@ def _template_voice_enabled(template: object) -> bool:
     return "voice" in supported
 
 
+def _client_tools_require_confirmation(template: object) -> bool:
+    """Whether irreversible client-tool page actions need user confirmation.
+
+    Reads ``configurations.client_tools.require_confirmation`` (default
+    False — see the field docstring: no in-widget approval sheet exists yet, so
+    gating stays off until that surface ships). Mirrors the flag the browser's
+    own action layer consults.
+    """
+    configurations = getattr(template, "configurations", None)
+    ct = getattr(configurations, "client_tools", None) if configurations else None
+    return bool(getattr(ct, "require_confirmation", False)) if ct else False
+
+
 # ---------------------------------------------------------------------------
 # POST /widget/session
 # ---------------------------------------------------------------------------
@@ -273,6 +286,7 @@ async def create_widget_session_handler(
         quick_replies=quick_replies,
         enable_text_input=enable_text_input,
         voice_enabled=_template_voice_enabled(template),
+        client_tools_require_confirmation=_client_tools_require_confirmation(template),
     )
 
 

@@ -1533,6 +1533,17 @@ class ClientToolsConfig(BaseModel):
             "deterministic where content inspection is not."
         ),
     )
+    require_confirmation: bool = Field(
+        default=False,
+        description=(
+            "Require human confirmation before irreversible page actions "
+            "(pay / delete / final submit). Default FALSE: there is no in-widget "
+            "approval sheet yet, so gating would dead-end a task with nothing "
+            "for the user to approve. A merchant flips this on only once an "
+            "approval surface ships. Reversible actions (toggles, fills, tabs) "
+            "are NEVER gated regardless of this flag."
+        ),
+    )
 
     @field_validator("tools")
     @classmethod
