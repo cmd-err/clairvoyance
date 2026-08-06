@@ -176,9 +176,18 @@ _CLIENT_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
         "description": (
             "Read the user's current page: its interactive elements and "
             "visible text, including any status or error messages. Returns "
-            "the page AS IT IS RIGHT NOW — cheap to call again after "
-            "something changes. Use this to ANSWER questions about the page; "
-            "use perform_page_task to CHANGE it."
+            "the page AS IT IS RIGHT NOW.\n"
+            "\n"
+            "Use this ONLY to ANSWER a question about the page ('what's on "
+            "this page?', 'is my email filled in?'). To CHANGE anything, "
+            "call perform_page_task instead — do not read first to look for "
+            "the control, because perform_page_task explores and reads on "
+            "its own, and a preparatory read only costs a turn.\n"
+            "\n"
+            "It shows the CURRENT screen only. Something not listed here may "
+            "still exist behind a menu, tab or dropdown — absence from this "
+            "snapshot is not evidence the feature is missing, so never tell "
+            "the user it does not exist based on one read."
         ),
         "properties": {},
         "required": [],
@@ -186,11 +195,24 @@ _CLIENT_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     "perform_page_task": {
         "description": (
             "Do a task on the user's current page — fill fields, choose "
-            "options, click through a flow. Give the COMPLETE goal in one "
-            "call, in plain English; it runs its own look/act/verify loop in "
-            "the browser and returns when finished. Do NOT break the task "
-            "into separate calls. It stops and asks first before anything "
-            "irreversible (payment, deletion, final submit)."
+            "options, click through a flow, change a setting. Give the "
+            "COMPLETE goal in one call, in plain English; it runs its own "
+            "look/act/verify loop in the browser and returns when finished. "
+            "Do NOT break the task into separate calls.\n"
+            "\n"
+            "JUST CALL IT. Do not ask the user 'would you like me to…' — "
+            "if they asked for something on the page, that IS the "
+            "permission. It explores on its own: if the control is behind a "
+            "Settings menu, a tab or a dropdown, it opens those itself, so "
+            "you do NOT need to find the control first or walk the user "
+            "through where it lives.\n"
+            "\n"
+            "Do NOT call read_page first to check whether something is "
+            "possible — this tool already reads the page every step, and a "
+            "preparatory read just costs a turn.\n"
+            "\n"
+            "It stops and asks first before anything irreversible (payment, "
+            "deletion, final submit), so you never need to gate it yourself."
         ),
         "properties": {
             "goal": {
