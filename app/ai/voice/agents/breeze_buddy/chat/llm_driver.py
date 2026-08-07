@@ -40,6 +40,7 @@ async def stream(
     log_label: str = "chat",
     tool_context_retention: Optional[Dict[str, str]] = None,
     tool_context_projection: Optional[Dict[str, List[str]]] = None,
+    parallel_tool_calls: Optional[bool] = None,
 ) -> AsyncIterator[DriverEvent]:
     """Issue one streaming LLM call; yield text deltas + tool calls.
 
@@ -58,7 +59,9 @@ async def stream(
     fraction of the tokens. Honoured only by the Anthropic path.
     """
     if isinstance(llm_service, BaseOpenAILLMService):
-        async for event in _stream_openai(llm_service, context, log_label):
+        async for event in _stream_openai(
+            llm_service, context, log_label, parallel_tool_calls
+        ):
             yield event
         return
     if isinstance(llm_service, AnthropicLLMService):
@@ -90,6 +93,7 @@ async def _stream_openai(
     service: BaseOpenAILLMService,
     context: LLMContext,
     log_label: str,
+    parallel_tool_calls: Optional[bool] = None,
 ) -> AsyncIterator[DriverEvent]:
     """Mirror BaseOpenAILLMService._process_context minus the frame layer.
 
@@ -127,6 +131,13 @@ async def _stream_openai(
         if value is not None:
             params[attr] = value
     params.update(getattr(settings, "extra", None) or {})
+    # Opt-in single-tool-call mode. Client tools park the turn on ONE
+    # unanswered tool_use; a parallel batch would orphan its siblings and
+    # permanently invalidate the session history (OpenAI 400: "tool_call_ids
+    # did not have response messages"). Only set when the caller asks, so
+    # ordinary chat keeps whatever the provider defaults to.
+    if parallel_tool_calls is not None and params.get("tools"):
+        params["parallel_tool_calls"] = parallel_tool_calls
 
     logger.debug(f"[{log_label}] llm_driver: openai stream model={settings.model}")
 

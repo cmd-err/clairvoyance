@@ -685,6 +685,17 @@ class ChatAgent:
                 log_label=f"chat#{self.session_id[:8]}",
                 tool_context_retention=prep.tool_retention,
                 tool_context_projection=prep.tool_projection,
+                # Only when this template actually exposes browser-executed
+                # tools. A client tool parks the turn on ONE unanswered
+                # tool_use, so a parallel batch means the extras get deferred
+                # (see the client_calls branch) and the model has to spend a
+                # whole extra turn re-requesting them. Asking for one call at
+                # a time removes that round trip at the source.
+                #
+                # Deliberately NOT set for templates without client tools:
+                # ordinary Buddy Assist chat keeps parallel server-side tool
+                # calls exactly as before.
+                parallel_tool_calls=False if self._active_client_tools else None,
             ):
                 if kind == "text":
                     text = cast(str, payload)
@@ -1020,6 +1031,64 @@ class ChatAgent:
                 # The turn ends here, so the session lock is RELEASED while
                 # the browser works. A slow page task can never exhaust the
                 # lock TTL.
+                # EXACTLY ONE client tool may be pending at a time.
+                #
+                # Everything above rests on "the unanswered tool_use IS the
+                # pending state". That is exactly right for one call and
+                # silently wrong for two: the browser answers them
+                # independently, the FIRST answer resumes the turn, the LLM
+                # emits an assistant message, and the siblings are now
+                # orphaned tool_use blocks with no result. Every later turn
+                # replays that history and the provider rejects it:
+                #
+                #   400 - An assistant message with 'tool_calls' must be
+                #   followed by tool messages responding to each
+                #   'tool_call_id'. The following tool_call_ids did not have
+                #   response messages: call_lF6QFf..., call_vpp2l1...
+                #
+                # The session is then permanently unusable — no retry can fix
+                # it, because the bad history is persisted. Measured twice on
+                # real sessions, both killed outright.
+                #
+                # So: park on the first call, and answer the rest RIGHT HERE
+                # with a real tool_result. History stays completable by
+                # construction, exactly one call is ever pending (the
+                # invariant the whole design assumes), and the model simply
+                # re-requests what it still needs on the next turn. No lock
+                # change, no new table, no provider feature required.
+                deferred = client_calls[1:]
+                client_calls = client_calls[:1]
+                if deferred:
+                    logger.info(
+                        "ChatAgent {}: {} extra client tool call(s) deferred — "
+                        "one page task at a time",
+                        self.session_id,
+                        len(deferred),
+                    )
+                    await insert_chat_message(
+                        session_id=self.session_id,
+                        role=ChatMessageRole.USER,
+                        content=None,
+                        content_blocks=tool_results_to_user_blocks(
+                            [
+                                (
+                                    c.tool_call_id,
+                                    {
+                                        "ok": False,
+                                        "steps_completed": 0,
+                                        "what_changed": [],
+                                        "aborted_reason": (
+                                            "not_run: only one page task runs at a "
+                                            "time. Request this again on the next "
+                                            "turn if it is still needed."
+                                        ),
+                                    },
+                                )
+                                for c in deferred
+                            ]
+                        ),
+                    )
+
                 for call in client_calls:
                     yield SSEEvent(
                         event="client_tool_call",
