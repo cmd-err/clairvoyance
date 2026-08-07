@@ -23,7 +23,10 @@ Origin + per-IP rate limit. All other routes use the session-bound
 ``widget_token`` minted at create-time.
 """
 
+import os
+
 from fastapi import APIRouter, Depends, File, Request, Response, UploadFile, status
+from fastapi.responses import FileResponse
 
 from app.api.routers.breeze_buddy.widget_common import options_cors_response
 from app.api.security.breeze_buddy.widget_token import (
@@ -334,6 +337,35 @@ async def get_widget_session_state(
     ctx: WidgetSessionContext = Depends(require_widget_session),
 ) -> WidgetSessionStateResponse:
     return await get_widget_session_state_handler(session_id, ctx)
+
+
+# ---------------------------------------------------------------------------
+# Static: serve the widget bundle for injection onto arbitrary (e.g. HTTPS)
+# pages that can't reach the local dev server. Dev/test only.
+# ---------------------------------------------------------------------------
+
+
+_WIDGET_DIST_CANDIDATES = [
+    "/Users/harsh.tiwari/Documents/breeze-repos/loom/packages/breeze-buddy-assist-widget/dist/assist.js",
+]
+
+
+@router.get(
+    "/assist.js",
+    summary="Serve the bundled widget (assist.js) for cross-site injection",
+    include_in_schema=False,
+)
+async def serve_widget_bundle():
+    from fastapi.responses import FileResponse
+
+    for path in _WIDGET_DIST_CANDIDATES:
+        if os.path.exists(path):
+            return FileResponse(
+                path,
+                media_type="application/javascript",
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
+    raise HTTPException(status_code=404, detail="assist.js not built")
 
 
 __all__ = ["router"]

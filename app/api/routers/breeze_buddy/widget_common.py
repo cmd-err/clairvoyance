@@ -186,7 +186,9 @@ async def resolve_widget_config_for_request(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Origin required for widget routes",
         )
-    if not cfg.allowed_origins or origin not in cfg.allowed_origins:
+    if not cfg.allowed_origins or (
+        origin not in cfg.allowed_origins and "*" not in cfg.allowed_origins
+    ):
         logger.warning(
             f"widget: origin {origin!r} not in allowed_origins for "
             f"widget_config={cfg.id}"

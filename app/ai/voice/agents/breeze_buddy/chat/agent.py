@@ -1690,10 +1690,11 @@ class ChatAgent:
         try:
             raw = await handler_fn(args_for_handler, None)
         except Exception as exc:
-            logger.error(
-                f"ChatAgent {self.session_id}: handler {call.function_name!r} "
-                f"raised: {exc}",
-                exc_info=True,
+            logger.opt(exception=True).error(
+                "ChatAgent {}: handler {!r} raised: {}",
+                self.session_id,
+                call.function_name,
+                exc,
             )
             return ({"status": "error", "error": f"{type(exc).__name__}: {exc}"}, None)
 

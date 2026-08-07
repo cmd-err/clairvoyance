@@ -189,10 +189,10 @@ async def _subscriber_loop() -> None:
             logger.info("cancel_bus: subscriber cancelled (app shutdown)")
             raise
         except Exception as exc:
-            logger.error(
-                f"cancel_bus: subscriber error ({exc!r}); "
-                f"reconnecting in {backoff:.1f}s",
-                exc_info=True,
+            logger.opt(exception=True).error(
+                "cancel_bus: subscriber error ({!r}); reconnecting in {:.1f}s",
+                exc,
+                backoff,
             )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)

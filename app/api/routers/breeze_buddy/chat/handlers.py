@@ -44,6 +44,7 @@ from app.ai.voice.agents.breeze_buddy.chat.turn_core import (
     run_chat_turn,
 )
 from app.ai.voice.agents.breeze_buddy.llm import get_llm_service
+from app.ai.voice.llm.types import LLMConfiguration
 from app.ai.voice.agents.breeze_buddy.template.cache import get_template_by_id_cached
 from app.ai.voice.agents.breeze_buddy.template.transformation_function import (
     TEMPLATE_FUNCTION_REGISTRY,
@@ -617,9 +618,22 @@ async def _turn_sse_stream(
             # Full exception (incl. SDK / DB internals) goes to logs; the
             # SSE payload is intentionally generic — provider stack traces,
             # internal URLs, and SQL strings should not reach the client.
-            logger.error(
-                f"chat turn stream for session {session_id} crashed: {exc}",
-                exc_info=True,
+            # NEVER f-string the exception into a loguru message, and never
+            # pass ``exc_info`` — that is a stdlib-logging kwarg. Loguru treats
+            # ANY kwarg as a formatting argument, so it calls ``.format()`` on
+            # the message; an exception whose text contains braces (an LLM
+            # provider returning ``{'error': {...}}`` is the common case) then
+            # blows up with ``KeyError: "'error'"`` INSIDE the error handler.
+            #
+            # Measured: that killed this generator before it could emit the
+            # ``error``/``turn_end`` events, so the stream just died and the
+            # widget showed "your message may not have been delivered" — while
+            # the real failure was never logged at all.
+            #
+            # Positional args are safe: ``.format()`` parses the TEMPLATE for
+            # fields, not the substituted values.
+            logger.opt(exception=True).error(
+                "chat turn stream for session {} crashed: {}", session_id, exc
             )
             yield format_sse(
                 SSEEvent(
@@ -1027,7 +1041,24 @@ async def client_infer_handler(
             },
         )
 
-    llm = await get_llm_service(resolve_llm_configuration(template), pooled=True)
+    # The inner loop wants FAST and CHEAP, not strong. It makes one decision
+    # per step against a compact element list — a small model does that as
+    # well as a large one, and a page task runs it up to ``max_steps`` times,
+    # so the conversational model's latency is paid over and over.
+    #
+    # Until now ``inner_model`` was declared in template config, documented,
+    # and never read: every inner step ran on the main chat model.
+    llm_cfg = resolve_llm_configuration(template)
+    inner_model = getattr(ct_cfg, "inner_model", None)
+    if inner_model:
+        llm_cfg = (
+            llm_cfg.model_copy(update={"model": inner_model})
+            if llm_cfg is not None
+            else LLMConfiguration(model=inner_model)
+        )
+        logger.debug("client-tool infer using inner_model={}", inner_model)
+
+    llm = await get_llm_service(llm_cfg, pooled=True)
     context = LLMContext(
         messages=[
             cast(Any, {"role": m.role, "content": m.content}) for m in req.messages

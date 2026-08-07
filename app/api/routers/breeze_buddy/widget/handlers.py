@@ -900,10 +900,10 @@ async def voice_connect_handler(
         try:
             session_info = await start_daily_session(lead_id, enable_recording=False)
         except Exception as exc:
-            logger.error(
-                f"widget voice: start_daily_session failed for lead {lead_id}: "
-                f"{exc}",
-                exc_info=True,
+            logger.opt(exception=True).error(
+                "widget voice: start_daily_session failed for lead {}: {}",
+                lead_id,
+                exc,
             )
             # Rollback channel back to CHAT so the user can retry.
             try:

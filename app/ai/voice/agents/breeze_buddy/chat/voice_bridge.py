@@ -322,9 +322,8 @@ class WidgetVoiceBridge:
                 except AttributeError:
                     pass
         except Exception as exc:  # noqa: BLE001
-            logger.error(
-                f"[voice-bridge] turn failed for session {self.session_id}: {exc}",
-                exc_info=True,
+            logger.opt(exception=True).error(
+                "[voice-bridge] turn failed for session {}: {}", self.session_id, exc
             )
             await self._emit_rtvi(
                 _RTVI_ERROR, {"code": "internal", "message": "voice turn failed"}
