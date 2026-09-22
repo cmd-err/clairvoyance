@@ -1474,7 +1474,14 @@ class ClientContextConfig(BaseModel):
 # exposing it invites the outer LLM to micromanage the page step by step
 # (read → act → read …), which costs a full LLM turn per DOM action. The
 # whole point of ``perform_page_task`` is that the loop runs in the browser.
-EXPOSABLE_CLIENT_TOOLS: frozenset[str] = frozenset({"read_page", "perform_page_task"})
+# ``open_widget``/``close_widget`` drive the widget's own chrome via its
+# imperative host API, not page perception — the launcher and panel live in
+# the widget's shadow DOM, which page perception deliberately excludes, so a
+# goal like "open the assistant" is unreachable through the perceiving
+# subagent by design.
+EXPOSABLE_CLIENT_TOOLS: frozenset[str] = frozenset(
+    {"read_page", "perform_page_task", "open_widget", "close_widget"}
+)
 
 
 class ClientToolsConfig(BaseModel):

@@ -25,7 +25,16 @@ Origin + per-IP rate limit. All other routes use the session-bound
 
 import os
 
-from fastapi import APIRouter, Depends, File, Request, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse
 
 from app.api.routers.breeze_buddy.widget_common import options_cors_response
@@ -345,27 +354,48 @@ async def get_widget_session_state(
 # ---------------------------------------------------------------------------
 
 
+# Dev-only: point at locally built widget dist dirs, separated by os.pathsep.
+# Unset in production — the route then 404s everything.
 _WIDGET_DIST_CANDIDATES = [
-    "/Users/harsh.tiwari/Documents/breeze-repos/loom/packages/breeze-buddy-assist-widget/dist/assist.js",
+    p
+    for p in os.environ.get("WIDGET_BUNDLE_DIST_DIRS", "").split(os.pathsep)
+    if p
 ]
+
+# The widget build is code-split: `assist.js` is a tiny classic-script loader
+# that injects the ES-module `assist.core.js`, which lazily imports
+# `chunks/*.js`. The loader resolves the core RELATIVE TO ITSELF
+# (`new URL('assist.core.js', loaderUrl)`), so the browser requests
+# `.../widget/assist.core.js` and `.../widget/chunks/<name>.js`. Serving only
+# the loader (the old behaviour) made every core/chunk request 404 and the
+# widget never mounted.
 
 
 @router.get(
-    "/assist.js",
-    summary="Serve the bundled widget (assist.js) for cross-site injection",
+    "/{file_path:path}",
+    summary="Serve the bundled widget (assist.js + split core/chunks) for cross-site injection",
     include_in_schema=False,
 )
-async def serve_widget_bundle():
+async def serve_widget_bundle(file_path: str):
     from fastapi.responses import FileResponse
 
-    for path in _WIDGET_DIST_CANDIDATES:
-        if os.path.exists(path):
+    # Only ever serve .js bundle assets; every other path under this router
+    # belongs to a real endpoint and must not be shadowed by a static mount.
+    if not file_path.endswith(".js"):
+        raise HTTPException(status_code=404, detail="not a widget asset")
+
+    # Path-traversal guard: resolve the candidate and require it to stay
+    # inside the dist dir.
+    for dist in _WIDGET_DIST_CANDIDATES:
+        root = os.path.realpath(dist)
+        target = os.path.realpath(os.path.join(root, file_path))
+        if target.startswith(root + os.sep) and os.path.exists(target):
             return FileResponse(
-                path,
+                target,
                 media_type="application/javascript",
                 headers={"Cache-Control": "no-store, max-age=0"},
             )
-    raise HTTPException(status_code=404, detail="assist.js not built")
+    raise HTTPException(status_code=404, detail=f"{file_path} not built")
 
 
 __all__ = ["router"]

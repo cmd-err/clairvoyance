@@ -193,6 +193,30 @@ _CLIENT_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
         "properties": {},
         "required": [],
     },
+    "open_widget": {
+        "description": (
+            "Open the assistant chat panel on the user's screen. Call this "
+            "when the user asks to open, show, launch or bring up the "
+            "assistant / chat / widget, or when they say things like 'open "
+            "you', 'open the chat' or click-free equivalents of the "
+            "launcher. Instant: it calls the widget's own open() API "
+            "directly, so do NOT use perform_page_task to hunt for the "
+            "launcher button — the assistant's own controls are not part of "
+            "the page it can see."
+        ),
+        "properties": {},
+        "required": [],
+    },
+    "close_widget": {
+        "description": (
+            "Close / collapse the assistant chat panel on the user's screen. "
+            "Call this when the user asks to close, hide, dismiss or "
+            "minimise the assistant / chat / widget. Instant: calls the "
+            "widget's own close() API directly."
+        ),
+        "properties": {},
+        "required": [],
+    },
     "perform_page_task": {
         "description": (
             "Do a task on the user's current page — fill fields, choose "
