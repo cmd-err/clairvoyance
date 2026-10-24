@@ -1,6 +1,12 @@
+import ast
 import datetime
-import inspect
+import functools
 import operator
+import resource
+import sys
+import threading
+import types
+from multiprocessing import get_context
 from typing import Any, Callable, Dict, Optional
 
 from RestrictedPython import (
@@ -28,10 +34,33 @@ from app.core.logger import logger
 # sandbox escape (walking `().__class__.__base__.__subclasses__()` to reach
 # subprocess.Popen / recover real builtins) is rejected at COMPILE time, not by
 # a fragile AST name denylist. `safer_getattr` additionally blocks every
-# attribute whose name starts with "_". Even so, an in-process interpreter is
-# not a hard security boundary: this whole feature is gated OFF by default via
-# ENABLE_CUSTOM_PYTHON_FUNCTIONS (enforced at flow-build time), and true
-# out-of-process isolation is the tracked defense-in-depth follow-up.
+# attribute whose name starts with "_". Template code never runs in this
+# process: each call runs in a fresh child with a memory cap that is killed at
+# its deadline, so a runaway handler cannot hold this process's GIL or memory.
+# shortcut: the child shares the pod's network and service-account token, so a
+# RestrictedPython escape would still reach them; move execution to a separate
+# no-egress runner (docs/CUSTOM_FUNCTION_SANDBOX.md) before self-serve merchants
+# get custom functions. The feature stays gated by ENABLE_CUSTOM_PYTHON_FUNCTIONS.
+
+# fork, not spawn/forkserver: those re-run the parent's main script (run.py, the
+# whole app) in every child. The child only runs sandboxed code and is killed.
+_FORK = get_context("fork")
+_CHILD_MEMORY_BYTES = 128 * 1024 * 1024
+_CHILD_SLOTS = threading.BoundedSemaphore(4)
+
+# The datetime MODULE holds module references of its own; handlers only ever
+# need its value types, so they get those under the same names.
+_SAFE_DATETIME = types.SimpleNamespace(
+    date=datetime.date,
+    datetime=datetime.datetime,
+    time=datetime.time,
+    timedelta=datetime.timedelta,
+    timezone=datetime.timezone,
+    tzinfo=datetime.tzinfo,
+    MINYEAR=datetime.MINYEAR,
+    MAXYEAR=datetime.MAXYEAR,
+    UTC=datetime.timezone.utc,
+)
 
 # Value allow-list layered on top of RestrictedPython's own safe_builtins. These
 # are safe builtins the legacy sandbox exposed and existing handlers may rely on.
@@ -78,8 +107,23 @@ _EXTRA_SAFE_BUILTINS: Dict[str, Any] = {
     "tuple": tuple,
     "type": type,
     "zip": zip,
-    "datetime": datetime,
+    "datetime": _SAFE_DATETIME,
 }
+
+
+def _no_module(value: Any) -> Any:
+    """Backstop: a module object in sandboxed hands is a door out of it."""
+    if isinstance(value, types.ModuleType):
+        raise AttributeError("module objects are not available in custom functions")
+    return value
+
+
+def _guarded_getattr(obj: Any, name: str, default: Any = None) -> Any:
+    return _no_module(safer_getattr(obj, name, default))
+
+
+def _guarded_getitem(obj: Any, index: Any) -> Any:
+    return _no_module(default_guarded_getitem(obj, index))
 
 
 class CompilationError(Exception):
@@ -135,8 +179,8 @@ def _build_restricted_namespace() -> Dict[str, Any]:
     builtins_ns = dict(safe_builtins)
     builtins_ns.update(_EXTRA_SAFE_BUILTINS)
     namespace["__builtins__"] = builtins_ns
-    namespace["_getattr_"] = safer_getattr
-    namespace["_getitem_"] = default_guarded_getitem
+    namespace["_getattr_"] = _guarded_getattr
+    namespace["_getitem_"] = _guarded_getitem
     namespace["_getiter_"] = default_guarded_getiter
     namespace["_iter_unpack_sequence_"] = guarded_iter_unpack_sequence
     namespace["_write_"] = full_write_guard
@@ -145,17 +189,65 @@ def _build_restricted_namespace() -> Dict[str, Any]:
     return namespace
 
 
-def compile_custom_function(name: str, source: str) -> Optional[Callable]:
-    """
-    Compile python_code source into a callable handler function.
+def _child_main(writer: Any, source: str, args: Any, context: Any) -> None:
+    """Child process: cap memory before any template code runs, then call handler."""
+    if sys.platform == "linux":  # RLIMIT_AS is not enforced on macOS
+        with open("/proc/self/statm") as f:
+            used = int(f.read().split()[0]) * resource.getpagesize()
+        limit = used + _CHILD_MEMORY_BYTES
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    try:
+        namespace = _build_restricted_namespace()
+        code = compile_restricted_exec(source).code
+        assert code is not None  # source was checked at build
+        exec(code, namespace)  # noqa: S102
+        writer.send((True, namespace["handler"](args, context)))
+    except BaseException as e:  # noqa: BLE001 - re-raised in the parent
+        writer.send((False, e))
 
-    The source code must define a top-level callable named 'handler' that accepts
-    two arguments: (args, context). Compilation and execution happen under
-    RestrictedPython (see the module security note above).
+
+def _run_in_child(source: str, timeout: float, args: Any, context: Any) -> Any:
+    """Run one handler call in a fresh child process; kill it at the deadline."""
+    if not _CHILD_SLOTS.acquire(blocking=False):
+        raise RuntimeError("Too many custom functions running at once")
+    try:
+        reader, writer = _FORK.Pipe(duplex=False)
+        with reader, writer:
+            child = _FORK.Process(
+                target=_child_main, args=(writer, source, args, context)
+            )
+            child.start()
+            writer.close()  # so a child that dies without answering reads as EOF
+            try:
+                if not reader.poll(timeout):
+                    raise TimeoutError(f"Function timed out after {timeout}s")
+                ok, value = reader.recv()
+            except EOFError:
+                raise RuntimeError("Custom function stopped without a result") from None
+            finally:
+                child.kill()
+                child.join()
+    finally:
+        _CHILD_SLOTS.release()
+    if ok:
+        return value
+    raise value
+
+
+def compile_custom_function(
+    name: str, source: str, timeout: float = 5
+) -> Optional[Callable]:
+    """
+    Check python_code and return a callable that runs it in a child process.
+
+    The source must define a top-level ``def handler(args, context)``. Nothing
+    from the source runs here (see the module security note above); top-level
+    code runs in the child on every call.
 
     Args:
         name: Function name (for logging/debugging)
         source: Python source code string
+        timeout: Seconds before the child running a call is killed
 
     Returns:
         The handler callable, or None if compilation failed (logs warning)
@@ -164,37 +256,36 @@ def compile_custom_function(name: str, source: str) -> Optional[Callable]:
         result = compile_restricted_exec(source, filename=f"<custom_function:{name}>")
         if result.errors:
             raise CompilationError("; ".join(result.errors))
-        code_obj = result.code
-        if code_obj is None:
+        if result.code is None:
             raise CompilationError("RestrictedPython produced no code object")
 
-        namespace = _build_restricted_namespace()
-        exec(code_obj, namespace)  # noqa: S102 - RestrictedPython-compiled code
+        tree = ast.parse(source)
+        if any(isinstance(n, (ast.Import, ast.ImportFrom)) for n in ast.walk(tree)):
+            raise CompilationError("import statements are not allowed")
 
-        # Extract handler function
-        handler = namespace.get("handler")
-        if not handler:
+        handler = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "handler"
+            ),
+            None,
+        )
+        if handler is None:
             logger.warning(
-                f"[custom function '{name}'] python_code does not define a top-level 'handler' callable"
+                f"[custom function '{name}'] python_code does not define a top-level 'def handler(args, context)'"
             )
             return None
 
-        if not callable(handler):
+        if len(handler.args.posonlyargs + handler.args.args) < 2 and not (
+            handler.args.vararg
+        ):
             logger.warning(
-                f"[custom function '{name}'] 'handler' is not callable (found {type(handler).__name__})"
+                f"[custom function '{name}'] 'handler' must accept at least 2 arguments (args, context)"
             )
             return None
 
-        # Validate signature accepts at least 2 args
-        sig = inspect.signature(handler)
-        param_count = len(sig.parameters)
-        if param_count < 2:
-            logger.warning(
-                f"[custom function '{name}'] 'handler' must accept at least 2 arguments (args, context), got {param_count}"
-            )
-            return None
-
-        return handler
+        return functools.partial(_run_in_child, source, timeout)
 
     except SyntaxError as e:
         logger.warning(f"[custom function '{name}'] syntax error: {e}")

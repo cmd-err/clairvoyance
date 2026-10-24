@@ -508,7 +508,9 @@ class CustomPythonGlobalFunctionAdapter:
         func = GlobalCustomFunction.model_validate(config)
 
         # Compile python_code at build time
-        compiled = compile_custom_function(func.name, func.python_code)
+        compiled = compile_custom_function(
+            func.name, func.python_code, func.timeout_seconds
+        )
         if compiled is None:
             # Compilation failed - log warning and skip this function
             # Other functions in the template continue normally

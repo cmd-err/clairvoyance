@@ -7,6 +7,8 @@ default at the flow-build gate.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from app.ai.voice.agents.breeze_buddy.utils import parser
@@ -77,11 +79,8 @@ def test_full_write_guard_still_blocks_arbitrary_object_writes():
     handler = compile_custom_function("neg", src)
     assert callable(handler)
 
-    class _Plain:
-        pass
-
     with pytest.raises(TypeError):
-        handler({}, _Plain())
+        handler({}, types.SimpleNamespace())
 
 
 def test_custom_python_disabled_by_default_at_build(monkeypatch):
@@ -107,3 +106,40 @@ def test_custom_python_disabled_by_default_at_build(monkeypatch):
         wrapped_handler=lambda *a, **k: None,
     )
     assert result is None
+
+
+def test_datetime_value_types_still_work():
+    src = (
+        "def handler(args, context):\n"
+        "    d = datetime.datetime(2026, 1, 2, tzinfo=datetime.UTC)\n"
+        "    return {'next': (d + datetime.timedelta(days=1)).day,\n"
+        "            'date': datetime.date(2026, 1, 2).isoformat()}"
+    )
+    handler = compile_custom_function("dates", src)
+    assert handler is not None
+    assert handler({}, {}) == {"next": 3, "date": "2026-01-02"}
+
+
+def test_sandbox_datetime_carries_no_module_objects():
+    exposed = parser._EXTRA_SAFE_BUILTINS["datetime"]
+    assert not isinstance(exposed, types.ModuleType)
+    for name in dir(exposed):
+        if not name.startswith("_"):
+            assert not isinstance(getattr(exposed, name), types.ModuleType), name
+
+
+def test_guards_refuse_to_hand_out_module_objects():
+    holder = types.SimpleNamespace(mod=types)
+    with pytest.raises(AttributeError):
+        parser._guarded_getattr(holder, "mod")
+    with pytest.raises(AttributeError):
+        parser._guarded_getitem({"mod": types}, "mod")
+    assert parser._guarded_getattr(types.SimpleNamespace(n=1), "n") == 1
+
+
+def test_runaway_code_never_runs_at_build_and_is_killed_on_call():
+    src = "while True:\n    pass\ndef handler(a, c):\n    return {}"
+    handler = compile_custom_function("spin", src, timeout=1)  # returns: nothing ran
+    assert handler is not None
+    with pytest.raises(TimeoutError):
+        handler({}, {})
