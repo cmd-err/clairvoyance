@@ -246,7 +246,7 @@ async def test_a_reply_without_a_sid_keeps_its_count(
     await _dispatch(harness, fake_redis, make_lead("lead-1"))
 
     assert limiter.unrecorded == []
-    assert harness.deferred == [("lead-1", 10)]
+    assert harness.deferred == [("lead-1", w.UNKNOWN_DIAL_DEFER_S)]
 
 
 async def test_unreadable_rules_defer_without_paging(

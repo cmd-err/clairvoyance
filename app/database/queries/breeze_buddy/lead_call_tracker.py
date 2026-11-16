@@ -191,6 +191,49 @@ def defer_lead_next_attempt_and_release_lock_query(
     return text, values
 
 
+def adopt_unknown_dial_query(
+    lead_id: str, call_id: str, telephony_number_id: str
+) -> Tuple[str, List[Any]]:
+    """
+    Attach a call whose dial we never got a reply for to its lead, and count
+    its line. One statement: the lead moves BACKLOG -> PROCESSING with the
+    provider's call id, and the number's channels go up by one, or neither.
+
+    Only a still-BACKLOG outbound lead matches, so in the normal flow (the
+    worker already wrote PROCESSING) this is a no-op. Not gated on is_locked:
+    the customer may answer while the worker is still waiting for the
+    provider's reply. The +1 is unconditional (the call is already live) and
+    the normal end-of-call release takes it back. A number id that does not
+    exist leaves telephony_number_id NULL and counts nothing.
+    """
+    text = f"""
+        WITH adopted AS (
+            UPDATE "{LEAD_CALL_TRACKER_TABLE}"
+            SET "status" = $4, "call_id" = $2, "call_initiated_time" = NOW(),
+                "telephony_number_id" = (
+                    SELECT "id" FROM "{TELEPHONY_NUMBER_TABLE}" WHERE "id" = $3
+                ),
+                "updated_at" = NOW()
+            WHERE "id" = $1 AND "status" = $5 AND "call_direction" = $6
+            RETURNING *
+        ), counted AS (
+            UPDATE "{TELEPHONY_NUMBER_TABLE}"
+            SET "channels" = COALESCE("channels", 0) + 1, "updated_at" = NOW()
+            WHERE "id" IN (SELECT "telephony_number_id" FROM adopted)
+        )
+        SELECT * FROM adopted;
+    """
+    values = [
+        lead_id,
+        call_id,
+        telephony_number_id,
+        LeadCallStatus.PROCESSING.value,
+        LeadCallStatus.BACKLOG.value,
+        CallDirection.OUTBOUND.value,
+    ]
+    return text, values
+
+
 def update_lead_call_details_query(
     id: str,
     status: LeadCallStatus,

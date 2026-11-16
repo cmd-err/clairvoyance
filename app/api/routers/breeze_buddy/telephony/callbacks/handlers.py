@@ -25,6 +25,9 @@ from app.ai.voice.agents.breeze_buddy.managers.calls import (
 from app.ai.voice.agents.breeze_buddy.services.agent_router.client import (
     safe_release_pod,
 )
+from app.ai.voice.agents.breeze_buddy.services.telephony.base_provider import (
+    callback_signed,
+)
 from app.ai.voice.agents.breeze_buddy.services.telephony.exotel.exotel import (
     exotel_dial_text,
 )
@@ -42,7 +45,7 @@ from app.core.concurrency import spawn_background_task
 from app.core.config.static import TWILIO_TEMPLATE_WEBSOCKET_URL
 from app.core.logger import logger
 from app.core.logger.context import set_log_context
-from app.database.accessor import get_lead_by_call_id
+from app.database.accessor import adopt_unknown_dial, get_lead_by_call_id
 
 # Vobiz's make-call docs say the hangup callback's CallStatus is "always
 # completed", while its call-status page lists busy / no-answer / timeout.
@@ -380,6 +383,22 @@ async def handle_callback_status(request: Request, provider: str) -> Response:
             await safe_release_pod(
                 call_sid=str(call_sid), reason=f"status_{call_status}"
             )
+
+        # A dial we got no reply for ended: attach it to its lead (lead and
+        # number ids are echoed on the hangup URL) so the end flow below finds
+        # it. A no-op when the lead is already PROCESSING.
+        lead_id = request.query_params.get("lead_id")
+        number_id = request.query_params.get("number_id") or ""
+        if (
+            lead_id
+            and provider.lower() == "plivo"
+            and call_status.lower() in ended_statuses
+            and isinstance(call_sid, str)
+            and callback_signed(
+                lead_id, number_id, request.query_params.get("signature") or ""
+            )
+        ):
+            await adopt_unknown_dial(lead_id, call_sid, number_id)
 
         # ``completed`` has no DB writer: the agent closes its own row and the
         # failure branch below excludes it. A call that ends before the media
