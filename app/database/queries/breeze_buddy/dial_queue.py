@@ -225,3 +225,138 @@ def stuck_dials_query() -> Tuple[str, List[Any]]:
         LIMIT 100;
     """
     return text, []
+
+
+def due_templates_query() -> Tuple[str, List[Any]]:
+    """
+    Each template that has waiting leads, with its earliest due time. Written
+    as a recursive skip-scan on dial_queue_waiting_ix: one index probe per
+    template, never one row per waiting lead (a plain GROUP BY would read
+    every waiting row).
+    """
+    text = f"""
+        WITH RECURSIVE t AS (
+            (SELECT template_id, due_at FROM "{DIAL_QUEUE_TABLE}"
+              WHERE state = 'waiting' ORDER BY template_id, due_at LIMIT 1)
+            UNION ALL
+            SELECT n.template_id, n.due_at FROM t CROSS JOIN LATERAL (
+                SELECT template_id, due_at FROM "{DIAL_QUEUE_TABLE}"
+                 WHERE state = 'waiting' AND template_id > t.template_id
+                 ORDER BY template_id, due_at LIMIT 1) n
+        )
+        SELECT template_id::text AS template_id, due_at FROM t;
+    """
+    return text, []
+
+
+def free_numbers_query(number_ids: List[str]) -> Tuple[str, List[Any]]:
+    """Free lines on the given numbers (only AVAILABLE ones with room)."""
+    text = """
+        SELECT id, COALESCE(maximum_channels, 0) - COALESCE(channels, 0) AS free
+        FROM telephony_numbers
+        WHERE id = ANY($1::varchar[]) AND status = 'AVAILABLE'
+          AND COALESCE(channels, 0) < COALESCE(maximum_channels, 0);
+    """
+    return text, [number_ids]
+
+
+def route_numbers_query() -> Tuple[str, List[Any]]:
+    """Every number, narrow columns, newest first (the routing rule's order)."""
+    text = """
+        SELECT id, provider, status, merchant_id, reseller_id
+        FROM telephony_numbers ORDER BY created_at DESC;
+    """
+    return text, []
+
+
+def route_templates_query() -> Tuple[str, List[Any]]:
+    """What routing and the per-template gates need, for every template with a
+    call config (a template without one has no route)."""
+    text = """
+        SELECT t.id::text AS template_id, t.telephony_number_id::text AS pinned_id,
+               c.merchant_id, c.reseller_id, c.calling_provider, c.enable_calling,
+               c.call_start_time, c.call_end_time
+        FROM template t JOIN call_execution_config c ON c.template_id = t.id;
+    """
+    return text, []
+
+
+# fill holds a number's row across a few round trips; a stalled client must
+# not keep call ends on that number waiting: the server ends the transaction.
+# Any lock wait inside fill is bounded too (it should never wait).
+FILL_STALL_GUARD = (
+    "SET LOCAL idle_in_transaction_session_timeout = '5s';"
+    " SET LOCAL lock_timeout = '2s';"
+)
+
+
+def lock_number_query(number_id: str) -> Tuple[str, List[Any]]:
+    """fill F1: hold the number; another pod filling it -> no row -> skip."""
+    text = """
+        SELECT GREATEST(0, COALESCE(maximum_channels, 0) - COALESCE(channels, 0)) AS free
+        FROM telephony_numbers
+        WHERE id = $1 AND status = 'AVAILABLE'
+        FOR UPDATE SKIP LOCKED;
+    """
+    return text, [number_id]
+
+
+def live_by_merchant_query(number_id: str) -> Tuple[str, List[Any]]:
+    """fill F2: calls each merchant holds on this number."""
+    text = f"""
+        SELECT merchant_id, count(*)::int AS live FROM "{DIAL_QUEUE_TABLE}"
+        WHERE number_id = $1 AND state <> 'waiting' GROUP BY merchant_id;
+    """
+    return text, [number_id]
+
+
+def fill_candidates_query(template_ids: List[str], k: int) -> Tuple[str, List[Any]]:
+    """fill F3: the k oldest due leads of each template routed to the number."""
+    text = f"""
+        SELECT q.lead_id, q.merchant_id, q.due_at
+        FROM unnest($1::uuid[]) AS t(template_id)
+        CROSS JOIN LATERAL (
+            SELECT d.lead_id, d.merchant_id, d.due_at FROM "{DIAL_QUEUE_TABLE}" d
+             WHERE d.template_id = t.template_id AND d.state = 'waiting'
+               AND d.due_at <= now()
+             ORDER BY d.due_at LIMIT $2) q;
+    """
+    return text, [template_ids, k]
+
+
+def grant_query(number_id: str, lead_ids: List[str]) -> Tuple[str, List[Any]]:
+    """fill F4: a lead cancelled a moment ago no longer matches, and a row
+    another statement holds (a call end, a cancel) is skipped, never waited
+    for: fill already holds the number, and a call end holds the row first
+    and then wants the number."""
+    text = f"""
+        UPDATE "{DIAL_QUEUE_TABLE}"
+           SET state = 'granted', number_id = $1, ticket = gen_random_uuid(),
+               state_at = now()
+         WHERE lead_id IN (
+               SELECT lead_id FROM "{DIAL_QUEUE_TABLE}"
+                WHERE lead_id = ANY($2::varchar[]) AND state = 'waiting'
+                  FOR UPDATE SKIP LOCKED)
+        RETURNING lead_id, ticket::text AS ticket;
+    """
+    return text, [number_id, lead_ids]
+
+
+def take_lines_query(number_id: str, count: int) -> Tuple[str, List[Any]]:
+    """fill F5: count exactly what was granted."""
+    text = """
+        UPDATE telephony_numbers
+           SET channels = COALESCE(channels, 0) + $2, updated_at = now()
+         WHERE id = $1;
+    """
+    return text, [number_id, count]
+
+
+def in_flight_by_number_query(number_ids: List[str]) -> Tuple[str, List[Any]]:
+    """Lines held by rows not yet live (granted / dialing), per number."""
+    text = f"""
+        SELECT number_id, count(*)::int AS n FROM "{DIAL_QUEUE_TABLE}"
+        WHERE number_id = ANY($1::varchar[]) AND state IN ('granted', 'dialing')
+        GROUP BY number_id;
+    """
+    return text, [number_ids]
