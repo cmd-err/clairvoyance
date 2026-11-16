@@ -32,9 +32,14 @@ from .breeze_buddy.credentials import (
     update_credential,
 )
 from .breeze_buddy.dial_queue import (
+    claim_dialing,
     delete_waiting_dial,
+    drop_ended_live_rows,
     enqueue_dial,
     feed_dial_queue,
+    give_back_dial,
+    mark_dial_live,
+    stuck_dials,
 )
 from .breeze_buddy.lead_call_tracker import (
     acquire_lock_on_lead_by_id,
@@ -84,9 +89,14 @@ from .breeze_buddy.template import (
 )
 
 __all__ = [
+    "claim_dialing",
     "delete_waiting_dial",
     "enqueue_dial",
     "feed_dial_queue",
+    "drop_ended_live_rows",
+    "give_back_dial",
+    "mark_dial_live",
+    "stuck_dials",
     "is_number_blacklisted",
     "add_blacklisted_number",
     "remove_blacklisted_number",

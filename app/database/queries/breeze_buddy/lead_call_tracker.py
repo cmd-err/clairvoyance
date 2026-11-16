@@ -202,9 +202,12 @@ def adopt_unknown_dial_query(
     Only a still-BACKLOG outbound lead matches, so in the normal flow (the
     worker already wrote PROCESSING) this is a no-op. Not gated on is_locked:
     the customer may answer while the worker is still waiting for the
-    provider's reply. The +1 is unconditional (the call is already live) and
-    the normal end-of-call release takes it back. A number id that does not
-    exist leaves telephony_number_id NULL and counts nothing.
+    provider's reply. A lead whose dial_queue row is dialing already holds
+    this call's line (fill counted it): the row becomes live and nothing is
+    counted again. Otherwise +1 (the call is already live) and the normal
+    end-of-call release takes it back. A number id that does not exist
+    leaves telephony_number_id NULL and counts nothing. Locks: lead -> row
+    -> number, as the finishing write.
     """
     text = f"""
         WITH adopted AS (
@@ -216,10 +219,15 @@ def adopt_unknown_dial_query(
                 "updated_at" = NOW()
             WHERE "id" = $1 AND "status" = $5 AND "call_direction" = $6
             RETURNING *
+        ), held AS (
+            UPDATE dial_queue q SET state = 'live', state_at = now()
+              FROM adopted a WHERE q.lead_id = a."id" AND q.state = 'dialing'
+            RETURNING q.lead_id
         ), counted AS (
             UPDATE "{TELEPHONY_NUMBER_TABLE}"
             SET "channels" = COALESCE("channels", 0) + 1, "updated_at" = NOW()
             WHERE "id" IN (SELECT "telephony_number_id" FROM adopted)
+              AND NOT EXISTS (SELECT 1 FROM held)
         )
         SELECT * FROM adopted;
     """
@@ -714,17 +722,30 @@ def update_lead_call_completion_details_query(
         status == LeadCallStatus.FINISHED
         and expected_status == LeadCallStatus.PROCESSING
     ):
-        # The claim returns the call's line in the same statement, reading the
-        # number itself, so "finished" and "line returned" can never come
-        # apart. Today's rule: an outbound call in a dialable mode holds one;
-        # an inbound call holds one on Plivo/Vobiz (taken at answer); a Twilio
-        # line is its IN_USE status, the others count channels.
+        # The claim returns the call's line in the same statement, so
+        # "finished" and "line returned" can never come apart. A dial_queue
+        # call's line is its row's (dialing/live): the row goes and its number
+        # gets one back. Otherwise (old path, inbound) the statement reads the
+        # lead's number itself and applies today's rule: an outbound call in a
+        # dialable mode holds one; an inbound call holds one on Plivo/Vobiz; a
+        # Twilio line is its IN_USE status, the others count channels. A
+        # granted row is only a reservation, never this call: its task's
+        # give-back returns it. Locks: lead -> row -> number.
         text = f"""
             WITH l AS (
                 UPDATE "{LEAD_CALL_TRACKER_TABLE}"
                 SET {", ".join(set_clauses)}
                 WHERE {where_clause}
                 RETURNING *
+            ), d AS (
+                DELETE FROM dial_queue q USING l
+                 WHERE q.lead_id = l.id AND q.state <> 'granted'
+                RETURNING q.state, q.number_id
+            ), r AS (
+                UPDATE "{TELEPHONY_NUMBER_TABLE}" t
+                   SET "channels" = GREATEST(0, COALESCE(t."channels", 0) - 1),
+                       "updated_at" = NOW()
+                  FROM d WHERE t.id = d.number_id AND d.state <> 'waiting'
             ), freed AS (
                 UPDATE "{TELEPHONY_NUMBER_TABLE}" t
                    SET "channels" = CASE WHEN t."provider" = 'TWILIO' THEN t."channels"
@@ -738,6 +759,7 @@ def update_lead_call_completion_details_query(
                          AND l."execution_mode" IN ('TELEPHONY', 'TELEPHONY_TEST'))
                      OR (l."call_direction" = 'INBOUND'
                          AND t."provider" IN ('PLIVO', 'VOBIZ')))
+                   AND NOT EXISTS (SELECT 1 FROM d WHERE d.state <> 'waiting')
             )
             SELECT * FROM l;
         """
@@ -951,18 +973,36 @@ def abort_lead_by_id_query(
         lead_id: Lead UUID
         cancellation_reason: Optional reason for cancellation
     """
+    # A lead whose dial_queue row already holds a line is "too late": no row
+    # comes back and the lead is left alone, but the cancel is recorded on
+    # the row, so exactly one final event follows: the call's own outcome if
+    # it was placed, else ABORT (give-back). A waiting row (or none) is cancelled: the row goes in the same
+    # statement. The lead row is locked first, the same order as the finishing
+    # write, and a concurrent grant is decided by the dial_queue row lock.
     text = f"""
-        UPDATE "{LEAD_CALL_TRACKER_TABLE}"
-        SET 
-            "status" = $1, 
-            "outcome" = $2, 
-            "updated_at" = NOW(),
-            "meta_data" = COALESCE("meta_data", '{{}}')::jsonb || $3::jsonb
-        WHERE 
-            "id" = $4
-            AND "status" IN ($5, $6)
-            AND ("outcome" IS NULL OR "outcome" = '')
-        RETURNING *;
+        WITH l AS (
+            SELECT "id" FROM "{LEAD_CALL_TRACKER_TABLE}"
+             WHERE "id" = $4 AND "status" IN ($5, $6)
+               AND ("outcome" IS NULL OR "outcome" = '')
+               FOR UPDATE
+        ), gone AS (
+            DELETE FROM dial_queue q USING l
+             WHERE q.lead_id = l."id" AND q.state = 'waiting'
+            RETURNING q.lead_id
+        ), too_late AS (
+            -- a line is already granted: record the cancel; the dial task
+            -- won't dial, or if it did, give-back leaves the call alone
+            UPDATE dial_queue q SET cancel_reason = $7 FROM l
+             WHERE q.lead_id = l."id" AND q.state IN ('granted', 'dialing')
+        )
+        UPDATE "{LEAD_CALL_TRACKER_TABLE}" t
+           SET "status" = $1, "outcome" = $2, "updated_at" = NOW(),
+               "meta_data" = COALESCE(t."meta_data", '{{}}')::jsonb || $3::jsonb
+          FROM l
+         WHERE t."id" = l."id"
+           AND (EXISTS (SELECT 1 FROM gone)
+                OR NOT EXISTS (SELECT 1 FROM dial_queue q WHERE q.lead_id = l."id"))
+        RETURNING t.*;
     """
 
     metadata = {
@@ -977,6 +1017,7 @@ def abort_lead_by_id_query(
         lead_id,
         LeadCallStatus.BACKLOG.value,
         LeadCallStatus.RETRY.value,
+        cancellation_reason or "cancelled",
     ]
     return text, values
 

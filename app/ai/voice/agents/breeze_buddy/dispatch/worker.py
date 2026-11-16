@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import aiohttp
 
@@ -93,15 +93,20 @@ from app.core.logger import logger
 from app.core.transport.http_client import create_aiohttp_session
 from app.database.accessor import (
     acquire_lock_on_lead_by_id,
+    claim_dialing,
     defer_lead_next_attempt_and_release_lock,
     get_lead_by_id,
+    get_telephony_number_by_id,
     get_template_by_id,
+    give_back_dial,
     is_number_blacklisted,
+    mark_dial_live,
     release_lock_on_lead_by_id,
     update_lead_call_completion_details,
     update_lead_call_details,
 )
 from app.schemas import ExecutionMode, LeadCallStatus, TelephonyNumber
+from app.schemas.breeze_buddy.core import TelephonyNumberStatus
 from app.services.redis import get_redis_service
 
 # ---------------------------------------------------------------------------
@@ -122,7 +127,7 @@ _GREETING_PREWARM_TIMEOUT_S = 15.0
 _GREETING_PREWARM_LIVE_TIMEOUT_S = 30.0
 
 
-async def _return_capacity(number: TelephonyNumber, token: str) -> None:
+async def _return_capacity(number: TelephonyNumber, token: Optional[str]) -> None:
     """
     Return capacity taken before a dial: DB line first, then the Redis token.
 
@@ -130,9 +135,22 @@ async def _return_capacity(number: TelephonyNumber, token: str) -> None:
     can land before our ``channels - 1``; it is refused, drops the token,
     and the line idles until the reconciler. Same order as
     ``_release_call_resources``.
+
+    Grant mode (no token): the line belongs to a dial_queue row and goes back
+    in ``dispatch_granted``'s give-back, never here.
     """
+    if token is None:
+        return
     await _release_number(number.id, number.provider)
     await release_channel_token(number.id, token)
+
+
+async def _granted_number(number_id: str) -> Optional[TelephonyNumber]:
+    """The number a grant was made on, unless it was disabled since."""
+    number = await get_telephony_number_by_id(number_id)
+    if number is None or number.status == TelephonyNumberStatus.DISABLED:
+        return None
+    return number
 
 
 async def _prewarm_initial_greeting_with_retry(
@@ -364,11 +382,22 @@ class Worker:
     # -- dispatch -----------------------------------------------------------
 
     async def _dispatch(
-        self, lead_id: str, session: Optional[aiohttp.ClientSession]
-    ) -> None:
+        self,
+        lead_id: str,
+        session: Optional[aiohttp.ClientSession],
+        grant: Optional[Tuple[str, str]] = None,
+    ) -> Optional[bool]:
         """
         Run the full dispatch flow for one lead. All exit paths leave the
         lead row in a consistent state (lock released, status correct).
+
+        ``grant`` = (number_id, ticket): the line was already given out by
+        dial_queue's fill on that number. Then no Redis token or ``channels``
+        increment is taken here, the task claims ``dialing`` with its ticket
+        before any "customer was called" record, and the line goes back only
+        through ``dispatch_granted``'s give-back. Every other step and its
+        order is the same as without a grant. Returns True when a dial may
+        have rung although no call was recorded (give-back's abort note).
         """
         logger.info(f"Worker {self._uuid}: picked lead {lead_id}")
 
@@ -563,7 +592,20 @@ class Worker:
                     )
                     return
 
-            number = await _get_available_number(config, template)
+            number = (
+                await _granted_number(grant[0])
+                if grant is not None
+                else await _get_available_number(config, template)
+            )
+            if not number and grant is not None:
+                # The granted number was disabled or removed after the grant:
+                # the give-back requeues the lead and the next fill routes it.
+                logger.warning(
+                    f"Worker {self._uuid}: granted number {grant[0]} is not usable "
+                    f"for lead {locked.id}; giving the line back"
+                )
+                lock_released = await self._release(locked.id)
+                return
             if not number:
                 # Permanent / semi-permanent failure: misconfigured template
                 # or no number in the fallback pool. Retrying every 10s would
@@ -612,43 +654,46 @@ class Worker:
                 )
                 return
 
-            # Channel token gate (Redis). Held until call-end webhook releases.
-            token = await acquire_channel_token(number.id)
-            if token is None:
-                # No capacity right now — re-schedule (see
-                # capacity_defer_seconds for the delay).
-                lock_released = await self._defer_and_release(
-                    locked.id, await capacity_defer_seconds(number.id, locked.id)
-                )
-                return
+            # Grant mode: the line was taken by fill (dial_queue + channels).
+            token: Optional[str] = None
+            if grant is None:
+                # Channel token gate (Redis). Held until call-end webhook releases.
+                token = await acquire_channel_token(number.id)
+                if token is None:
+                    # No capacity right now — re-schedule (see
+                    # capacity_defer_seconds for the delay).
+                    lock_released = await self._defer_and_release(
+                        locked.id, await capacity_defer_seconds(number.id, locked.id)
+                    )
+                    return
 
-            # DB-side bookkeeping: ``telephony_number.status`` (Twilio) or
-            # ``channels`` (Exotel/Plivo/Vobiz).
-            # FULL: the token matched no free line. Drop it, or
-            # the next worker pops it and is refused again. Only the
-            # reconciler restores it; no call was placed, so no call-end
-            # release will.
-            # ERROR: the DB could not answer, so the line may be free. Push
-            # the token back.
-            acquired_db = await _acquire_number(number)
-            if acquired_db is not NumberAcquire.ACQUIRED:
-                if acquired_db is NumberAcquire.FULL:
-                    logger.warning(
-                        f"Worker {self._uuid}: number {number.id} is full in "
-                        f"the DB despite a Redis token. Dropping the token, "
-                        "deferring."
+                # DB-side bookkeeping: ``telephony_number.status`` (Twilio) or
+                # ``channels`` (Exotel/Plivo/Vobiz).
+                # FULL: the token matched no free line. Drop it, or
+                # the next worker pops it and is refused again. Only the
+                # reconciler restores it; no call was placed, so no call-end
+                # release will.
+                # ERROR: the DB could not answer, so the line may be free. Push
+                # the token back.
+                acquired_db = await _acquire_number(number)
+                if acquired_db is not NumberAcquire.ACQUIRED:
+                    if acquired_db is NumberAcquire.FULL:
+                        logger.warning(
+                            f"Worker {self._uuid}: number {number.id} is full in "
+                            f"the DB despite a Redis token. Dropping the token, "
+                            "deferring."
+                        )
+                    else:
+                        logger.error(
+                            f"Worker {self._uuid}: DB acquire of number "
+                            f"{number.id} failed ({acquired_db.value}); the line "
+                            "may be free. Returning the token, deferring."
+                        )
+                        await release_channel_token(number.id, token)
+                    lock_released = await self._defer_and_release(
+                        locked.id, await capacity_defer_seconds(number.id, locked.id)
                     )
-                else:
-                    logger.error(
-                        f"Worker {self._uuid}: DB acquire of number "
-                        f"{number.id} failed ({acquired_db.value}); the line "
-                        "may be free. Returning the token, deferring."
-                    )
-                    await release_channel_token(number.id, token)
-                lock_released = await self._defer_and_release(
-                    locked.id, await capacity_defer_seconds(number.id, locked.id)
-                )
-                return
+                    return
 
             customer_mobile = (locked.payload or {}).get("customer_mobile_number")
             if not customer_mobile or not isinstance(customer_mobile, str):
@@ -658,6 +703,17 @@ class Worker:
                 )
                 await _return_capacity(number, token)
                 lock_released = await self._fail_and_release(locked.id, "INVALID_PHONE")
+                return
+
+            # Grant mode: still our line? Checked before any "customer was
+            # called" record, so a task whose line was taken back (repair after
+            # its pod looked dead) stops here and leaves no phantom record.
+            if grant is not None and not await claim_dialing(locked.id, grant[1]):
+                logger.warning(
+                    f"Worker {self._uuid}: lead {locked.id} no longer holds its "
+                    "granted line; not dialling"
+                )
+                lock_released = await self._release(locked.id)
                 return
 
             # Atomic check-and-record — the authoritative cap. Placement
@@ -763,6 +819,13 @@ class Worker:
                     # is attached to this lead when Plivo reports it.
                     callback_params={"lead_id": str(locked.id), "number_id": number.id},
                 )
+            except asyncio.CancelledError:
+                # Cut off mid-request (shutdown): the call may be ringing, so
+                # this is an unknown dial, not a free retry.
+                lock_released = await asyncio.shield(
+                    self._defer_and_release(locked.id, UNKNOWN_DIAL_DEFER_S)
+                )
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.error(
                     f"Worker {self._uuid}: provider.make_call failed for "
@@ -795,7 +858,7 @@ class Worker:
                 lock_released = await self._defer_and_release(
                     locked.id, 10 if call is None else UNKNOWN_DIAL_DEFER_S
                 )
-                return
+                return call is not None  # no reply: it may have rung
 
             call_sid = str(call.get("sid"))
 
@@ -842,13 +905,15 @@ class Worker:
                 lock_released = await self._defer_and_release(
                     locked.id, UNKNOWN_DIAL_DEFER_S
                 )
-                return
+                return True  # the call was placed
 
             # Success — token stays held until call-end webhook fires.
             # Lock stays held too; the call-end webhook releases it. Setting
             # lock_released so the defensive finally below doesn't unlock the
             # row out from under the webhook handler.
             lock_released = True
+            if grant is not None:
+                await mark_dial_live(locked.id, grant[1])
             logger.info(
                 f"Worker {self._uuid}: dialled lead {locked.id} via "
                 f"{number.provider.value} number {number.id} (call_sid={call_sid})"
@@ -864,6 +929,30 @@ class Worker:
                         f"Worker {self._uuid}: final lock release failed "
                         f"for {locked.id}: {e}"
                     )
+
+    async def dispatch_granted(
+        self,
+        lead_id: str,
+        number_id: str,
+        ticket: str,
+        session: Optional[aiohttp.ClientSession],
+    ) -> None:
+        """Dial a lead whose line fill already granted on ``number_id``."""
+        may_have_rung = False
+        try:
+            may_have_rung = bool(
+                await self._dispatch(lead_id, session, grant=(number_id, ticket))
+            )
+        except Exception as e:  # noqa: BLE001 — a dial task has no caller to raise to
+            logger.error(
+                f"Worker {self._uuid}: granted dial of lead {lead_id} failed: {e}",
+                exc_info=True,
+            )
+        finally:
+            # The one place a granted line goes back without a call; a no-op
+            # once the row is live or gone. Shielded so a deploy that cancels
+            # the task cannot leak the line.
+            await asyncio.shield(give_back_dial(lead_id, ticket, may_have_rung))
 
     # -- exit helpers -------------------------------------------------------
 

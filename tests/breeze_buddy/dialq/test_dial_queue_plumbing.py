@@ -100,15 +100,17 @@ def _lead(status: LeadCallStatus) -> LeadCallTracker:
 
 
 @pytest.mark.parametrize(
-    "status,row,expect_delete",
+    "status,expected,row,expect_delete",
     [
-        (LeadCallStatus.FINISHED, True, True),
-        (None, True, False),  # a mid-call outcome write
-        (LeadCallStatus.FINISHED, False, False),  # lost the claim
+        (LeadCallStatus.FINISHED, None, True, True),  # e.g. a terminal exit
+        (None, None, True, False),  # a mid-call outcome write
+        (LeadCallStatus.FINISHED, None, False, False),  # nothing written
+        # the finishing claim drops the row itself, in the same statement
+        (LeadCallStatus.FINISHED, LeadCallStatus.PROCESSING, True, False),
     ],
 )
 async def test_finishing_write_deletes_the_waiting_row(
-    monkeypatch, status, row, expect_delete
+    monkeypatch, status, expected, row, expect_delete
 ):
     deleted: List[str] = []
 
@@ -126,8 +128,8 @@ async def test_finishing_write_deletes_the_waiting_row(
     monkeypatch.setattr(lct, "delete_waiting_dial", delete)
     monkeypatch.setattr(lct, "_fire_hooks", lambda *_a: None)
 
-    await lct.update_lead_call_completion_details(
-        id="L1", status=status, outcome="X", expected_status=LeadCallStatus.PROCESSING
+    result = await lct.update_lead_call_completion_details(
+        id="L1", status=status, outcome="X", expected_status=expected
     )
 
     assert deleted == (["L1"] if expect_delete else [])

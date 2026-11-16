@@ -9,6 +9,7 @@ captured.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -188,6 +189,7 @@ async def test_a_refused_peek_ends_the_lead_before_any_capacity(
     assert await channel_tokens_available(harness.number.id) == 1
     assert lead.status == LeadCallStatus.FINISHED
     assert lead.outcome == "CALL_LIMIT_REACHED"
+    await asyncio.sleep(0)  # the webhook is sent in the background
     assert [data["outcome"] for _, data in limiter.webhooks] == ["CALL_LIMIT_REACHED"]
     assert harness.deferred == []
 
