@@ -31,10 +31,6 @@ from app.ai.voice.agents.breeze_buddy.dispatch.queue import (
     is_dispatchable,
     schedule_lead,
 )
-from app.ai.voice.agents.breeze_buddy.managers.inbound_channel import (
-    inbound_holds_channel,
-    release_inbound_channel,
-)
 from app.ai.voice.agents.breeze_buddy.managers.pre_checks import (
     PreCheckDecision,
     run_pre_checks,
@@ -573,70 +569,16 @@ async def _release_number(number_id: str, provider: CallProvider):
         await decrement_telephony_number_channels(number_id)
 
 
-def _releases_capacity(lead: LeadCallTracker, provider: CallProvider) -> bool:
-    """
-    Whether this callback still owes the telephony number a channel back.
-
-    Outbound: the worker took a channel (``_acquire_number``) plus a Redis
-    dispatch token before dialling, for every dispatchable execution mode.
-
-    Inbound: only the Plivo and Vobiz answer paths take a channel
-    (``admit_inbound_call``), and they do so as part of creating the
-    lead in PROCESSING. So release when this callback is the one moving the
-    lead off PROCESSING. Anything already terminal when we
-    looked it up either never held a channel (CAPACITY_REJECTED, BLOCKED_*
-    and out-of-hours all write a FINISHED row at answer time, before or
-    instead of any acquire) or has already had it returned by an earlier
-    callback. Releasing for those invents capacity the number does not have,
-    which then lets us over-commit the trunk until someone notices.
-
-    IMPORTANT — this is NOT a system-wide exactly-once guarantee. It holds
-    between callers that CLAIM the transition (an UPDATE carrying
-    ``expected_status``). ``handle_call_completion`` does not: it releases off
-    a pre-update snapshot and then runs an unconditional completion UPDATE, so
-    it can release a channel that a claiming caller then releases again.
-    Making every releaser claim first is tracked, and reverses an ordering the
-    current tests pin.
-    """
-    if lead.call_direction == CallDirection.OUTBOUND:
-        return is_dispatchable(lead.execution_mode)
-    return inbound_holds_channel(lead, provider)
-
-
 async def _release_call_resources(lead: LeadCallTracker) -> None:
-    """Give the telephony number its channel back once the call is over."""
-    # Inbound accounting lives in its own module so the IVR deferred-policy
-    # block can reach it without importing this file (which cannot be imported
-    # first — see inbound_channel's docstring). Delegating rather than
-    # repeating the fetch-and-decrement keeps ONE implementation of the
-    # inbound rule; two would be free to drift apart.
-    if lead.call_direction == CallDirection.INBOUND:
-        await release_inbound_channel(lead)
-        return
-
-    if not lead.telephony_number_id:
-        logger.info(f"No telephony number id for lead: {lead.id}")
-        return
-
-    telephony_number = await get_telephony_number_by_id(lead.telephony_number_id)
-    if not telephony_number:
-        logger.error(
-            f"Could not find telephony number with id: "
-            f"{lead.telephony_number_id} to release."
-        )
-        return
-
-    if not _releases_capacity(lead, telephony_number.provider):
-        return
-
-    await _release_number(telephony_number.id, telephony_number.provider)
-
-    if lead.call_direction == CallDirection.OUTBOUND:
-        # Event-driven dispatch: return the token to the channel semaphore.
-        # Inbound never takes one — there the DB counter is the whole gate.
-        # Idempotent in aggregate — reconcile_channel_tokens trims any
-        # over-count caused by duplicate webhooks within 60s.
-        await release_channel_token(telephony_number.id)
+    """The finishing claim already returned the line, in the same statement.
+    Left: the old path's Redis dispatch token, best-effort (the reconciler
+    heals it)."""
+    if (
+        lead.call_direction == CallDirection.OUTBOUND
+        and lead.telephony_number_id
+        and is_dispatchable(lead.execution_mode)
+    ):
+        await release_channel_token(lead.telephony_number_id)
 
 
 async def _retry_call(
@@ -812,18 +754,18 @@ async def reconcile_stuck_processing_leads():
             # mid-call outcome hook recorded.
             cleanup_meta = dict(locked_lead.metaData or {})
             cleanup_meta["cleanup"] = "stuck_processing_timeout"
-            await update_lead_call_completion_details(
+            finished = await update_lead_call_completion_details(
                 id=locked_lead.id,
                 status=LeadCallStatus.FINISHED,
                 outcome=locked_lead.outcome or "UNKNOWN",
                 meta_data=cleanup_meta,
                 call_end_time=datetime.now(timezone.utc),
+                expected_status=LeadCallStatus.PROCESSING,
             )
+            if finished is None:
+                # Another caller finished it between our lock and this write.
+                continue
 
-            # ``locked_lead`` is the pre-update snapshot: the lock was taken
-            # with expected_status=PROCESSING, so this sweep is by definition
-            # the callback transitioning the lead, and the inbound guard in
-            # _releases_capacity sees PROCESSING as intended.
             await _release_call_resources(locked_lead)
 
             # Only retry outbound telephony calls - inbound and test calls should not be retried
@@ -883,11 +825,6 @@ async def handle_call_completion(
             f"Failed to delete greeting audio from Redis for lead {lead.id}"
         )
 
-    # Always release telephony number (including transfers — bot leaves, cleanup happens here).
-    # Runs before the completion UPDATE below so the inbound guard in
-    # _releases_capacity still sees this lead as PROCESSING.
-    await _release_call_resources(lead)
-
     # Check if this is a transfer — for outcome override only
     is_transfer = (
         meta_data
@@ -897,27 +834,36 @@ async def handle_call_completion(
         lead.metaData and lead.metaData.get("transfer", {}).get("status") == "success"
     )
 
-    config = await _get_lead_config(lead)
-    if not config and lead.template not in TEMPLATELESS_PLACEHOLDER_TEMPLATES:
-        return
-
     # Override outcome to "TRANSFERRED" for transfer calls
     if is_transfer:
         outcome = "TRANSFERRED"
 
-    # Persist the call record unconditionally — config lookup must not gate this.
-    # _get_lead_config can fail (e.g. unknown provider enum value in the DB) for
-    # reasons unrelated to recording the call outcome, transcription, and metadata.
+    # Claim PROCESSING -> FINISHED. Only the caller that wins returns the line
+    # and schedules the retry; the reaper, the 30 s reconcile and the
+    # unanswered webhook claim the same way. No config gate before this: a
+    # template without a call config must still finish here and free its line.
     updated_lead = await update_lead_call_completion_details(
         id=lead.id,
         status=LeadCallStatus.FINISHED,
         outcome=outcome,
         meta_data=meta_data,
         call_end_time=call_end_time,
+        expected_status=LeadCallStatus.PROCESSING,
     )
+    if updated_lead is None:
+        # Another caller finished this lead first. Keep the agent's data;
+        # status=None so the finished hook (CRM mirror) does not fire again.
+        return await update_lead_call_completion_details(
+            id=lead.id,
+            outcome=outcome,
+            meta_data=meta_data,
+            call_end_time=call_end_time,
+        )
 
     # call.completed is mirrored to the CRM inside
     # update_lead_call_completion_details (the terminal choke point).
+
+    await _release_call_resources(lead)
 
     # Config is only needed for retry scheduling — a failure here must not
     # prevent the lead record from being marked FINISHED above.
@@ -974,36 +920,32 @@ async def handle_unanswered_calls(call_id: str):
             f"Failed to delete greeting audio from Redis for lead {lead.id}: {e}"
         )
 
-    # Release telephony number channel — for outbound this runs before the FINISHED
-    # guard because the channel must be freed regardless of lead status, and
-    # _release_number is idempotent (SQL uses GREATEST(0, ...)). For inbound the
-    # guard in _releases_capacity is stricter: only a lead still PROCESSING here
-    # is holding a channel, so a duplicate or post-block callback releases nothing.
-    await _release_call_resources(lead)
-
-    # Guard: if another callback already finished this lead, skip to avoid duplicate retries.
-    # This happens when the lock race causes multiple calls for the same lead — each call's
-    # callback arrives independently and would otherwise each create a retry entry.
-    if lead.status == LeadCallStatus.FINISHED:
-        logger.info(
-            f"Lead {lead.id} is already FINISHED for call_id: {call_id}, skipping unanswered handler."
-        )
-        return
-
-    config = await _get_lead_config(lead)
-    if not config and lead.template not in TEMPLATELESS_PLACEHOLDER_TEMPLATES:
-        return
-
-    await update_lead_call_completion_details(
+    # Claim PROCESSING -> FINISHED first. A duplicate webhook, or one that
+    # arrives after another caller finished the lead, loses the claim and
+    # neither returns the line again nor creates a second retry. No config
+    # gate before the claim: without a config the lead still finishes and
+    # frees its line; only the retry below needs one.
+    finished = await update_lead_call_completion_details(
         id=lead.id,
         status=LeadCallStatus.FINISHED,
         outcome="NO_ANSWER",
         meta_data={},
         call_end_time=datetime.now(timezone.utc),
+        expected_status=LeadCallStatus.PROCESSING,
     )
+    if finished is None:
+        logger.info(
+            f"Lead {lead.id} was already finished for call_id: {call_id}, "
+            "skipping unanswered handler."
+        )
+        return
 
     # call.completed is mirrored to the CRM inside
     # update_lead_call_completion_details (the terminal choke point).
+
+    await _release_call_resources(lead)
+
+    config = await _get_lead_config(lead)
 
     # Only retry outbound telephony calls - inbound and test calls should not be retried
     if (
@@ -1083,13 +1025,16 @@ async def reconcile_completed_call(call_id: str) -> None:
         # reaper does — 30s sooner rather than ten minutes later.
         cleanup_meta = dict(claimed.metaData or {})
         cleanup_meta["cleanup"] = "completed_no_pipeline"
-        await update_lead_call_completion_details(
+        finished = await update_lead_call_completion_details(
             id=claimed.id,
             status=LeadCallStatus.FINISHED,
             outcome=claimed.outcome or "UNKNOWN",
             meta_data=cleanup_meta,
             call_end_time=datetime.now(timezone.utc),
+            expected_status=LeadCallStatus.PROCESSING,
         )
+        if finished is None:
+            return
 
         await _release_call_resources(claimed)
 

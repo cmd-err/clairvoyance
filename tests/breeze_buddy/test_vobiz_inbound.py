@@ -47,7 +47,6 @@ from app.ai.voice.agents.breeze_buddy.ivr import (
     walker as walker_mod,
 )
 from app.ai.voice.agents.breeze_buddy.managers import (
-    calls as calls_mod,
     inbound_channel as ic_mod,
 )
 from app.ai.voice.agents.breeze_buddy.services.inbound_policy import PolicyResult
@@ -55,6 +54,9 @@ from app.api.routers.breeze_buddy.telephony.answer import handlers as ans_mod
 from app.core.logger import logger
 from app.database.queries.breeze_buddy.dispatch import (
     count_processing_by_telephony_number_query,
+)
+from app.database.queries.breeze_buddy.lead_call_tracker import (
+    update_lead_call_completion_details_query,
 )
 from app.schemas import (
     CallDirection,
@@ -265,33 +267,6 @@ class AnswerRig:
         return response
 
 
-class ReleaseSpy:
-    """Records what ``_release_call_resources`` gave back for an inbound lead."""
-
-    def __init__(self, number: TelephonyNumber) -> None:
-        self.number = number
-        self.decremented: List[str] = []
-        self.tokens: List[str] = []
-
-    def install(self, monkeypatch: pytest.MonkeyPatch) -> "ReleaseSpy":
-        async def get_number(_number_id):
-            return self.number
-
-        async def decrement(number_id):
-            self.decremented.append(number_id)
-
-        async def release_token(number_id, token=None):
-            self.tokens.append(number_id)
-            return True
-
-        # Patch the collaborators, not release_inbound_channel itself, so the
-        # inbound_holds_channel predicate stays in the loop.
-        monkeypatch.setattr(ic_mod, "get_telephony_number_by_id", get_number)
-        monkeypatch.setattr(ic_mod, "decrement_telephony_number_channels", decrement)
-        monkeypatch.setattr(calls_mod, "release_channel_token", release_token)
-        return self
-
-
 @pytest.fixture
 def error_log():
     """ERROR lines logged while the test runs (loguru, so not caplog)."""
@@ -353,36 +328,20 @@ def test_a_call_with_no_resolved_number_takes_no_channel():
     assert ans_mod._gated_inbound_number("vobiz", {}) is None
 
 
-@pytest.mark.parametrize(
-    "provider,status,owed",
-    [
-        (CallProvider.VOBIZ, LeadCallStatus.PROCESSING, True),
-        (CallProvider.VOBIZ, LeadCallStatus.FINISHED, False),
-        (CallProvider.VOBIZ, LeadCallStatus.BACKLOG, False),
-        (CallProvider.PLIVO, LeadCallStatus.PROCESSING, True),
-        (CallProvider.EXOTEL, LeadCallStatus.PROCESSING, False),
-        (CallProvider.TWILIO, LeadCallStatus.PROCESSING, False),
-    ],
-)
-def test_a_vobiz_inbound_lead_owes_its_channel_only_while_processing(
-    provider, status, owed
-):
-    lead = make_inbound_lead(status=status)
-    assert ic_mod.inbound_holds_channel(lead, provider) is owed
-    # The call-end callback's predicate delegates to the same rule.
-    assert calls_mod._releases_capacity(lead, provider) is owed
-
-
 def test_gate_release_and_reconciler_name_the_same_providers():
     """The reconciler mints Redis tokens for M - in_flight channels. If its
     count names a provider the gate does not (or misses one it does), free
     capacity is miscounted on every number of that provider — silently."""
     gated = {p.value for p in ans_mod._GATED_INBOUND_PROVIDERS.values()}
-    released = {
-        p.value
-        for p in CallProvider
-        if ic_mod.inbound_holds_channel(make_inbound_lead(), p)
-    }
+    claim, _ = update_lead_call_completion_details_query(
+        "L1", LeadCallStatus.FINISHED, expected_status=LeadCallStatus.PROCESSING
+    )
+    returned = re.search(
+        r"""l\."call_direction" = 'INBOUND'\s+AND t\."provider" IN \(([^)]*)\)""",
+        claim,
+    )
+    assert returned is not None, f"no inbound provider list in:\n{claim}"
+    released = set(re.findall(r"'([A-Z]+)'", returned.group(1)))
     text, _ = count_processing_by_telephony_number_query()
     inbound = re.search(
         r"""l\."call_direction" = 'INBOUND'\s+AND n\."provider" IN \(([^)]*)\)""",
@@ -446,41 +405,6 @@ async def test_a_full_vobiz_number_turns_the_caller_away_busy(monkeypatch):
 # ---------------------------------------------------------------------------
 # Release: one channel back per admitted call, never more
 # ---------------------------------------------------------------------------
-
-
-async def test_an_admitted_vobiz_call_returns_exactly_one_channel(monkeypatch):
-    """Inbound never borrowed a dispatch token, so none goes back either."""
-    spy = ReleaseSpy(make_number(CallProvider.VOBIZ)).install(monkeypatch)
-
-    await calls_mod._release_call_resources(make_inbound_lead())
-
-    assert spy.decremented == ["num-1"]
-    assert spy.tokens == []
-
-
-async def test_a_duplicate_vobiz_status_callback_releases_nothing_more(monkeypatch):
-    """The second webhook sees the FINISHED row the first one wrote."""
-    spy = ReleaseSpy(make_number(CallProvider.VOBIZ)).install(monkeypatch)
-
-    await calls_mod._release_call_resources(
-        make_inbound_lead(LeadCallStatus.PROCESSING)
-    )
-    await calls_mod._release_call_resources(make_inbound_lead(LeadCallStatus.FINISHED))
-
-    assert spy.decremented == ["num-1"]
-
-
-async def test_a_vobiz_call_refused_at_the_gate_never_releases(monkeypatch):
-    """A capacity-rejected call wrote a FINISHED row and never held a channel;
-    releasing for it would invent capacity the trunk does not have."""
-    spy = ReleaseSpy(make_number(CallProvider.VOBIZ)).install(monkeypatch)
-    lead = make_inbound_lead(
-        status=LeadCallStatus.FINISHED, outcome=ans_mod.CAPACITY_REJECTED_OUTCOME
-    )
-
-    await calls_mod._release_call_resources(lead)
-
-    assert spy.decremented == []
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +607,6 @@ async def test_a_vobiz_websocket_lead_is_made_from_the_url_and_owns_the_channel(
     assert created["status"] == LeadCallStatus.PROCESSING
     assert created["telephony_number_id"] == "num-1"
     assert created["payload"] == {"customer_mobile_number": CALLER}
-    assert calls_mod._releases_capacity(lead, CallProvider.VOBIZ) is True
 
 
 @pytest.mark.parametrize(

@@ -48,8 +48,8 @@ def count_processing_by_telephony_number_query() -> Tuple[str, List[Any]]:
 
     "Holding a channel" is not the same as "is a live call", and the
     difference is the whole reason this query joins. It must return exactly
-    the set of leads that ``managers.calls._releases_capacity`` will hand a
-    channel back for — the two are a matched pair, and any disagreement
+    the set of leads whose line the finishing claim hands back
+    (``update_lead_call_completion_details_query``) — the two are a matched pair, and any disagreement
     silently miscounts free capacity:
 
     - OUTBOUND: took one in ``_acquire_number`` before dialling, for every
