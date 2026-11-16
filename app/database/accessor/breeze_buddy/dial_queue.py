@@ -7,22 +7,33 @@ end. Each accessor logs and returns a falsy value instead of raising.
 
 import asyncio
 from datetime import datetime
-from typing import Any, List
+from typing import Any, Callable, Dict, List, Tuple
 
 from app import database
 from app.core.logger import logger
 from app.database import db_connection
 from app.database.queries import run_parameterized_query
 from app.database.queries.breeze_buddy.dial_queue import (
+    FILL_STALL_GUARD,
     claim_dialing_query,
     delete_waiting_dial_query,
     drop_ended_live_rows_query,
+    due_templates_query,
     enqueue_dial_query,
     feed_dial_queue_query,
+    fill_candidates_query,
+    free_numbers_query,
     give_back_dial_query,
+    grant_query,
+    in_flight_by_number_query,
+    live_by_merchant_query,
     lock_lead_query,
+    lock_number_query,
     mark_dial_live_query,
+    route_numbers_query,
+    route_templates_query,
     stuck_dials_query,
+    take_lines_query,
 )
 
 
@@ -146,3 +157,78 @@ async def stuck_dials() -> List[Any]:
     except Exception as e:
         logger.error(f"stuck_dials failed: {e}")
         return []
+
+
+# --- reads and fill for the per-number tick (these raise: the tick logs and
+# --- skips one round; nothing on the call path depends on them) -------------
+
+
+async def due_templates() -> List[Any]:
+    """(template_id, earliest due_at) for every template with waiting leads."""
+    query_text, values = due_templates_query()
+    return list(await run_parameterized_query(query_text, values))
+
+
+async def free_numbers(number_ids: List[str]) -> Dict[str, int]:
+    """Free lines per AVAILABLE number that has room."""
+    query_text, values = free_numbers_query(number_ids)
+    rows = await run_parameterized_query(query_text, values)
+    return {r["id"]: int(r["free"]) for r in rows}
+
+
+async def route_numbers() -> List[Any]:
+    query_text, values = route_numbers_query()
+    return list(await run_parameterized_query(query_text, values))
+
+
+async def route_templates() -> List[Any]:
+    query_text, values = route_templates_query()
+    return list(await run_parameterized_query(query_text, values))
+
+
+async def in_flight_by_number(number_ids: List[str]) -> Dict[str, int]:
+    query_text, values = in_flight_by_number_query(number_ids)
+    rows = await run_parameterized_query(query_text, values)
+    return {r["number_id"]: int(r["n"]) for r in rows}
+
+
+async def fill_number(
+    number_id: str,
+    template_ids: List[str],
+    k: int,
+    pick: Callable[[int, Dict[str, int], List[Any]], List[str]],
+) -> List[Tuple[str, str]]:
+    """
+    Give up to k free lines of one number to due leads of the templates routed
+    to it, in ONE transaction holding the number's row (no network call
+    inside). ``pick(k, live, candidates)`` chooses the leads (fairness).
+    Returns (lead_id, ticket) for each line actually granted; channels go up
+    by exactly that many. Another pod filling the same number: nothing.
+    """
+    async with db_connection() as conn:
+        async with conn.transaction():
+            await conn.execute(FILL_STALL_GUARD)
+            sql, values = lock_number_query(number_id)
+            row = await conn.fetchrow(sql, *values)
+            if row is None:
+                return []
+            k = min(k, int(row["free"]))
+            if k <= 0:
+                return []
+            sql, values = live_by_merchant_query(number_id)
+            live = {
+                r["merchant_id"]: int(r["live"]) for r in await conn.fetch(sql, *values)
+            }
+            sql, values = fill_candidates_query(template_ids, k)
+            candidates = list(await conn.fetch(sql, *values))
+            chosen = pick(k, live, candidates)
+            if not chosen:
+                return []
+            sql, values = grant_query(number_id, chosen)
+            granted = [
+                (r["lead_id"], r["ticket"]) for r in await conn.fetch(sql, *values)
+            ]
+            if granted:
+                sql, values = take_lines_query(number_id, len(granted))
+                await conn.execute(sql, *values)
+            return granted
