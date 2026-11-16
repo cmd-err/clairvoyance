@@ -30,6 +30,7 @@ from app.database.queries.breeze_buddy.merchants import (
     delete_merchant_query,
     get_all_merchants_query,
     get_merchant_by_merchant_identifier_query,
+    get_merchant_call_caps_query,
     get_merchant_call_limits_query,
     get_merchant_s2s_token_query,
     get_merchants_by_ids_query,
@@ -523,3 +524,11 @@ async def get_merchants_with_call_limits() -> (
         if decoded:
             rules[merchant_id] = decoded
     return rules, unreadable
+
+
+async def get_merchant_call_caps() -> Dict[str, int]:
+    """{merchant_id: max concurrent calls} for merchants with a cap. Raises:
+    the tick keeps its last good caps on an error."""
+    query, values = get_merchant_call_caps_query()
+    rows = await run_parameterized_query(query, values)
+    return {r["merchant_id"]: int(r["max_concurrent_calls"]) for r in rows}

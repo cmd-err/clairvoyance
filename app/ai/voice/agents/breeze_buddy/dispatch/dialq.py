@@ -51,6 +51,7 @@ from app.database.accessor.breeze_buddy.dial_queue import (
 from app.database.accessor.breeze_buddy.dispatch import (
     count_processing_by_telephony_number,
 )
+from app.database.accessor.breeze_buddy.merchants import get_merchant_call_caps
 from app.services.redis import get_redis_service
 
 ROUTE_TTL_S = 10.0
@@ -85,20 +86,30 @@ def pick_number(
     return chosen[0]["id"] if chosen else None
 
 
-def pick_leads(k: int, live: Dict[str, int], candidates: List[Any]) -> List[str]:
+def pick_leads(
+    k: int,
+    live: Dict[str, int],
+    candidates: List[Any],
+    room: Optional[Dict[str, int]] = None,
+) -> List[str]:
     """Hand out k lines one at a time: to the merchant with the fewest live
     calls on this number; ties to the merchant whose next lead is older;
-    within a merchant oldest first."""
+    within a merchant oldest first. ``room[m]`` caps how many more calls a
+    capped merchant may get (merchants not in it are uncapped)."""
+    room = dict(room or {})
     queues: Dict[str, List[Any]] = {}
     for c in sorted(candidates, key=lambda c: c["due_at"]):
-        queues.setdefault(c["merchant_id"], []).append(c)
+        if room.get(c["merchant_id"], 1) > 0:
+            queues.setdefault(c["merchant_id"], []).append(c)
     held = dict(live)
     chosen: List[str] = []
     while len(chosen) < k and queues:
         merchant = min(queues, key=lambda m: (held.get(m, 0), queues[m][0]["due_at"]))
         chosen.append(queues[merchant].pop(0)["lead_id"])
         held[merchant] = held.get(merchant, 0) + 1
-        if not queues[merchant]:
+        if merchant in room:
+            room[merchant] -= 1
+        if not queues[merchant] or room.get(merchant, 1) <= 0:
             del queues[merchant]
     return chosen
 
@@ -110,6 +121,20 @@ _routes_at: List[float] = [-1e9]
 # A Twilio line is a status flip (AVAILABLE/IN_USE), not a channel count, so a
 # Twilio number is never served here even if listed.
 _twilio: Set[str] = set()
+_caps: Dict[str, Any] = {"at": -1e9, "caps": {}}  # merchant concurrent-call caps
+
+
+async def _merchant_caps() -> Dict[str, int]:
+    """Merchant caps, re-read at most every ROUTE_TTL_S. A failed read keeps
+    the last good caps (soft cap: never stops dialling, never drops caps)."""
+    now = time.monotonic()
+    if now - _caps["at"] > ROUTE_TTL_S:
+        _caps["at"] = now
+        try:
+            _caps["caps"] = await get_merchant_call_caps()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"merchant caps read failed, keeping the last: {e}")
+    return _caps["caps"]
 
 
 def _route(r: Any, numbers: List[Any]) -> Dict[str, Any]:
@@ -260,13 +285,16 @@ class Tick:
             return
 
         free = await free_numbers(list(by_number))
+        caps = await _merchant_caps()
         share = max(1, BB_WORKER_COUNT // 2)
         for number_id in random.sample(list(free), len(free)):
             slots = BB_WORKER_COUNT - len(self._tasks)
             if slots <= 0:
                 break
             k = min(free[number_id], slots, share)
-            granted = await fill_number(number_id, by_number[number_id], k, pick_leads)
+            granted = await fill_number(
+                number_id, by_number[number_id], k, pick_leads, caps
+            )
             for lead_id, ticket in granted:
                 task = asyncio.create_task(
                     self._worker.dispatch_granted(lead_id, number_id, ticket, session),
