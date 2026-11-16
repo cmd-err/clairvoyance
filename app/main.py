@@ -16,6 +16,7 @@ from app.ai.voice.agents.breeze_buddy.dispatch import (
     reap_stuck_processing_lists,
     reconcile_backlog_to_zset,
     reconcile_channel_tokens,
+    repair_dial_queue,
     start_promoter,
     start_workers,
     stop_promoter,
@@ -76,6 +77,7 @@ from app.core.middleware.widget_cors_bypass import CustomWidgetCorsBypassMiddlew
 from app.crm import api as crm_api
 from app.crm.worker_main import start_worker_role, stop_worker_role
 from app.database import close_db_pool, init_db_pool
+from app.database.accessor.breeze_buddy.dial_queue import dial_queue_missing
 from app.services.ingest_archive import IngestArchiveMiddleware
 from app.services.knowledge_base import (
     process_pending_documents as process_pending_kb_documents,
@@ -117,6 +119,10 @@ async def lifespan(_app: FastAPI):
         await init_db_pool()
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
+    # Call end and abort read dial_queue: a build rolled before migration 086
+    # must stop here, with the old pods still serving, not fail every call end.
+    if await dial_queue_missing():
+        raise RuntimeError("dial_queue is missing: apply migration 086 first")
     # Initialize Redis client
     try:
         if is_redis_configured():
@@ -223,6 +229,12 @@ async def lifespan(_app: FastAPI):
                     name="bb_feed_dial_queue",
                     func=feed_dial_queue_task,
                     interval_seconds=300,
+                )
+                # dial_queue repair: lines held by rows whose pod died.
+                _background_scheduler.register_task(
+                    name="bb_repair_dial_queue",
+                    func=repair_dial_queue,
+                    interval_seconds=60,
                 )
                 _background_scheduler.register_task(
                     name="bb_reap_stuck_processing_lists",

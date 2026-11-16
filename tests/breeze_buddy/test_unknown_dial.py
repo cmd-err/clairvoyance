@@ -303,7 +303,9 @@ async def test_adopt_once_and_counts_the_line_on_postgres():
     conn = await asyncpg.connect(DSN)
     try:
         await conn.execute("""
-            DROP TABLE IF EXISTS lead_call_tracker, telephony_numbers;
+            DROP TABLE IF EXISTS dial_queue, lead_call_tracker, telephony_numbers;
+            CREATE TABLE dial_queue (
+                lead_id text PRIMARY KEY, state text, state_at timestamptz);
             CREATE TABLE lead_call_tracker (
                 id text PRIMARY KEY, status text, call_direction text,
                 call_id text, call_initiated_time timestamptz,
@@ -335,7 +337,9 @@ async def test_adopt_once_and_counts_the_line_on_postgres():
         assert row["telephony_number_id"] is None
         assert await conn.fetchval("SELECT channels FROM telephony_numbers") == 3
     finally:
-        await conn.execute("DROP TABLE IF EXISTS lead_call_tracker, telephony_numbers;")
+        await conn.execute(
+            "DROP TABLE IF EXISTS dial_queue, lead_call_tracker, telephony_numbers;"
+        )
         await conn.close()
 
 

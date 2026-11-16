@@ -101,6 +101,11 @@ from app.schemas import (
 from app.services.gcp.storage.storage import upload_file_to_gcs
 from app.services.redis.client import get_redis_service
 
+# Merchant failure webhooks are sent inline (the lead is already finished;
+# a lost send is lost for good) but capped, so a slow endpoint can't hold a
+# dial slot or a reserved line.
+MERCHANT_WEBHOOK_TIMEOUT_S = 30
+
 
 async def _get_lead_config(lead: LeadCallTracker) -> Optional[CallExecutionConfig]:
     """
@@ -285,7 +290,11 @@ async def _run_pre_checks_for_lead(
             "orderId": lead.request_id,
         }
         try:
-            await send_webhook_with_retry(session, reporting_webhook_url, webhook_data)
+            # Capped: a slow merchant endpoint must not hold the dial slot.
+            await asyncio.wait_for(
+                send_webhook_with_retry(session, reporting_webhook_url, webhook_data),
+                MERCHANT_WEBHOOK_TIMEOUT_S,
+            )
         except Exception as e:
             logger.error(
                 f"Error sending pre-check failure webhook for lead {lead.id}: {e}"
@@ -359,7 +368,10 @@ async def finish_lead_call_limit_reached(
             "orderId": lead.request_id,
         }
         try:
-            await send_webhook_with_retry(session, reporting_webhook_url, webhook_data)
+            await asyncio.wait_for(
+                send_webhook_with_retry(session, reporting_webhook_url, webhook_data),
+                MERCHANT_WEBHOOK_TIMEOUT_S,
+            )
         except Exception as e:
             logger.error(f"Error sending call-limit webhook for lead {lead.id}: {e}")
     return True
