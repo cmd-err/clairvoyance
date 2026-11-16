@@ -8,7 +8,7 @@ the tick logs and skips that one round.
 
 import asyncio
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app import database
 from app.core.logger import logger
@@ -27,6 +27,7 @@ from app.database.queries.breeze_buddy.dial_queue import (
     give_back_dial_query,
     grant_query,
     in_flight_by_number_query,
+    live_by_capped_merchant_query,
     live_by_merchant_query,
     lock_lead_query,
     lock_number_query,
@@ -197,7 +198,8 @@ async def fill_number(
     number_id: str,
     template_ids: List[str],
     k: int,
-    pick: Callable[[int, Dict[str, int], List[Any]], List[str]],
+    pick: Callable[..., List[str]],
+    caps: Optional[Dict[str, int]] = None,
 ) -> List[Tuple[str, str]]:
     """
     Give up to k free lines of one number to due leads of the templates routed
@@ -222,7 +224,18 @@ async def fill_number(
             }
             sql, values = fill_candidates_query(template_ids, k)
             candidates = list(await conn.fetch(sql, *values))
-            chosen = pick(k, live, candidates)
+            # A merchant's cap (soft: fills on other numbers in the same
+            # instant can overshoot by a few lines) — read only when needed.
+            capped = sorted({c["merchant_id"] for c in candidates} & set(caps or {}))
+            room = None
+            if capped:
+                sql, values = live_by_capped_merchant_query(capped)
+                held = {
+                    r["merchant_id"]: int(r["live"])
+                    for r in await conn.fetch(sql, *values)
+                }
+                room = {m: (caps or {})[m] - held.get(m, 0) for m in capped}
+            chosen = pick(k, live, candidates, room)
             if not chosen:
                 return []
             sql, values = grant_query(number_id, chosen)

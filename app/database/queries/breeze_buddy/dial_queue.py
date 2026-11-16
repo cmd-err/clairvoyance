@@ -360,3 +360,13 @@ def in_flight_by_number_query(number_ids: List[str]) -> Tuple[str, List[Any]]:
         GROUP BY number_id;
     """
     return text, [number_ids]
+
+
+def live_by_capped_merchant_query(merchant_ids: List[str]) -> Tuple[str, List[Any]]:
+    """fill F3b: calls each capped merchant holds on ANY number (rows only)."""
+    text = f"""
+        SELECT merchant_id, count(*)::int AS live FROM "{DIAL_QUEUE_TABLE}"
+        WHERE state <> 'waiting' AND merchant_id = ANY($1::varchar[])
+        GROUP BY merchant_id;
+    """
+    return text, [merchant_ids]
