@@ -556,3 +556,57 @@ async def raise_dialq_stuck(count: int) -> None:
             },
         ],
     )
+
+
+async def raise_dialq_no_route(template_id: str) -> None:
+    """P1 — a template pinned to a listed number has waiting leads but that
+    number cannot dial now (disabled or deleted). Its leads WAIT; nothing is
+    finished. (Templates with no number at all stay on the old path.)"""
+    await _send(
+        alert_name=f"dialq_no_route:{template_id}",
+        throttle_seconds=_THROTTLE_P1,
+        title="[P1] Breeze Buddy: template has no number to dial from",
+        fields=[
+            {"name": "Template", "value": template_id},
+            {
+                "name": "Effect",
+                "value": "Its leads wait in dial_queue (not finished) until a number is usable.",
+            },
+            {
+                "name": "Action",
+                "value": (
+                    "Check the template's pinned number status, the merchant's own "
+                    "numbers / the pool on its calling_provider, and its call config."
+                ),
+            },
+        ],
+    )
+
+
+async def raise_dialq_drift(number_id: str, channels: int, expected: int) -> None:
+    """P2 — a listed number's channels counter differs from the calls holding
+    its lines, on two checks in a row. Alert only; nothing is changed."""
+    await _send(
+        alert_name=f"dialq_drift:{number_id}",
+        throttle_seconds=_THROTTLE_P1,
+        title="[P2] Breeze Buddy: line counter drift on a dial_queue number",
+        fields=[
+            {"name": "Number", "value": number_id},
+            {"name": "channels", "value": str(channels)},
+            {"name": "Calls holding lines", "value": str(expected)},
+        ],
+    )
+
+
+async def raise_dialq_tick_failing(fails: int, error: str) -> None:
+    """P1 — this pod's per-number tick has failed every second for ~30 s: its
+    listed numbers get no new calls from it (other pods' ticks may still)."""
+    await _send(
+        alert_name="dialq_tick_failing",
+        throttle_seconds=_THROTTLE_P1,
+        title="[P1] Breeze Buddy: per-number dialler tick keeps failing",
+        fields=[
+            {"name": "Failed ticks in a row", "value": str(fails)},
+            {"name": "Last error", "value": error[:300]},
+        ],
+    )

@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 from typing import Any, List, cast
 
+from app.ai.voice.agents.breeze_buddy.dispatch import worker as worker_mod
 from app.ai.voice.agents.breeze_buddy.dispatch.alerts import (
     clear_throttle,
     raise_channel_drift,
@@ -128,7 +129,12 @@ async def reconcile_backlog_to_zset() -> None:
     """
     try:
         limit = await dyn_cfg.BB_RECONCILE_BACKLOG_LIMIT()
-        leads = await get_unscheduled_backlog_leads(lookahead_seconds=120, limit=limit)
+        # The per-number dialler's leads are not the old path's to heal.
+        leads = await get_unscheduled_backlog_leads(
+            lookahead_seconds=120,
+            limit=limit,
+            exclude_templates=list(worker_mod.DIALQ_TEMPLATES),
+        )
     except Exception as e:  # noqa: BLE001
         logger.error(f"reconcile_backlog_to_zset: DB read failed: {e}")
         return
@@ -327,6 +333,10 @@ async def reconcile_channel_tokens() -> None:
     fixed_topup = 0
     fixed_trim = 0
     drift_alert_threshold = await dyn_cfg.BB_CHANNEL_DRIFT_ALERT_THRESHOLD()
+    # On a listed number nobody uses the tokens (the per-number dialler counts
+    # in channels only), so their "drift" is normal traffic, not failing
+    # webhooks. The list is still kept in step for a rollback.
+    listed = set(await dyn_cfg.BB_DIALQ_NUMBERS())
 
     for i, n in enumerate(numbers):
         # Preserve maximum_channels=0 (explicit zero capacity); only fall back
@@ -360,7 +370,7 @@ async def reconcile_channel_tokens() -> None:
         # Alert on sustained large drift — small drift (1–2 tokens) self-heals
         # silently every tick, but anything bigger usually means provider
         # webhooks are failing in volume.
-        if drift > drift_alert_threshold:
+        if drift > drift_alert_threshold and n.id not in listed:
             await raise_channel_drift(
                 telephony_number_id=n.id,
                 expected_free=expected_free,

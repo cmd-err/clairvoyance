@@ -225,6 +225,11 @@ CALL_LIMIT_UNAVAILABLE_DEFER_S = 30
 # wait long enough for Plivo's own webhook to report it before re-dialling.
 UNKNOWN_DIAL_DEFER_S = 300
 
+# Templates whose number is served by the per-number dialler on this pod
+# (refreshed every tick by dispatch/dialq.py). The old worker hands their
+# leads over without any write.
+DIALQ_TEMPLATES: set[str] = set()
+
 
 # ---------------------------------------------------------------------------
 # Single dispatch worker
@@ -421,6 +426,13 @@ class Worker:
                 f"Worker {self._uuid}: lead {lead_id} has non-dispatchable "
                 f"execution_mode={lead.execution_mode.value}; dropping without "
                 "dispatch (someone bypassed the schedule_lead gate)."
+            )
+            return
+        if grant is None and lead.template_id in DIALQ_TEMPLATES:
+            # Its number is on the per-number dialler: that path dials it.
+            logger.info(
+                f"Worker {self._uuid}: lead {lead_id} belongs to the per-number "
+                "dialler; handing over"
             )
             return
         if await self._reseller_paused(lead.reseller_id):
