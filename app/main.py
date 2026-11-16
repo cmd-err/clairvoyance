@@ -11,6 +11,7 @@ from app import __version__
 from app.ai.voice.agents.breeze_buddy.chat.cleanup import end_idle_chat_sessions
 from app.ai.voice.agents.breeze_buddy.dispatch import (
     clean_stale_bb_locks,
+    feed_dial_queue_task,
     monitor_dispatch_health,
     reap_stuck_processing_lists,
     reconcile_backlog_to_zset,
@@ -216,6 +217,12 @@ async def lifespan(_app: FastAPI):
                     name="bb_reconcile_backlog_to_zset",
                     func=reconcile_backlog_to_zset,
                     interval_seconds=BB_RECONCILE_BACKLOG_INTERVAL_S,
+                )
+                # dial_queue safety net: rows for BACKLOG leads that have none.
+                _background_scheduler.register_task(
+                    name="bb_feed_dial_queue",
+                    func=feed_dial_queue_task,
+                    interval_seconds=300,
                 )
                 _background_scheduler.register_task(
                     name="bb_reap_stuck_processing_lists",

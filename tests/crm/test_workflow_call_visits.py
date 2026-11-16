@@ -603,3 +603,25 @@ async def test_the_condition_square_routes_on_the_computed_answer(
 
     assert spent == {"reply_was-it-capped": "capped"}
     assert left == {"reply_was-it-capped": "else"}
+
+
+async def test_the_square_enqueues_its_lead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lead gets its dial_queue row at once instead of waiting for the
+    5-minute feeder."""
+    inserted: List[str] = []
+    minted: List[Dict[str, Any]] = []
+    _install(monkeypatch, inserted, minted=minted)
+    enqueued: List[Any] = []
+
+    async def fake_enqueue(lead_id: str, due_at: datetime) -> bool:
+        enqueued.append((lead_id, due_at))
+        return True
+
+    monkeypatch.setattr(call_node, "enqueue_dial", fake_enqueue)
+    run = _run()
+
+    await execute(run, _NODE, _DEFINITION)
+
+    assert enqueued == [(inserted[0], minted[0]["next_attempt_at"])]
