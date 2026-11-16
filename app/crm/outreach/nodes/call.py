@@ -30,6 +30,7 @@ from app.crm.outreach.nodes.spec import NodeParked
 from app.crm.outreach.schemas import EnrollmentRun, WorkflowDefinition, WorkflowNode
 from app.database.accessor import (
     create_lead_call_tracker,
+    enqueue_dial,
     get_call_execution_config_by_template_id,
     get_lead_by_id,
     get_template_by_id,
@@ -233,6 +234,9 @@ async def execute(
         )
 
     await update_lead_enrollment_id(lead_id, str(run.id))
+    # The waiting row the dialler fills from (a lead born FINISHED matches
+    # nothing). Without it the lead waits for the 5-minute feeder.
+    await enqueue_dial(lead_id, next_attempt_at)
     # lead_id as a FIELD — the join to Buddy's dial line needs a column.
     logger.bind(lead_id=lead_id).info(
         f"walker: run {run.id} "

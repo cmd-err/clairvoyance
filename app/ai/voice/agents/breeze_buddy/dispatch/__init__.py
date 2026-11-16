@@ -25,6 +25,7 @@ from app.ai.voice.agents.breeze_buddy.dispatch.queue import (
 )
 from app.ai.voice.agents.breeze_buddy.dispatch.reconcilers import (
     clean_stale_bb_locks,
+    feed_dial_queue_task,
     monitor_dispatch_health,
     reap_stuck_processing_lists,
     reconcile_backlog_to_zset,
@@ -46,6 +47,7 @@ __all__ = [
     "monitor_dispatch_health",
     "reap_stuck_processing_lists",
     "reconcile_backlog_to_zset",
+    "feed_dial_queue_task",
     "reconcile_channel_tokens",
     "release_channel_token",
     "schedule_lead",
