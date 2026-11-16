@@ -11,7 +11,7 @@ Over-releasing invents capacity the trunk does not have.
 from __future__ import annotations
 
 import os
-from typing import Any, List, Optional, Tuple, cast
+from typing import Any, List, Optional, cast
 
 import pytest
 from fastapi import WebSocket
@@ -23,7 +23,6 @@ from starlette.responses import HTMLResponse
 # keeps this line above the next one on its own.
 from app.ai.voice.agents.breeze_buddy import dispatch as _dispatch  # noqa: F401
 from app.ai.voice.agents.breeze_buddy.managers import (
-    calls as calls_mod,
     inbound_channel as ic_mod,
 )
 from app.ai.voice.agents.breeze_buddy.services.inbound_policy import (
@@ -86,134 +85,10 @@ def make_number(provider: CallProvider = CallProvider.PLIVO) -> TelephonyNumber:
     )
 
 
-class ReleaseSpy:
-    """Records what _release_call_resources actually did."""
-
-    def __init__(self, number: Optional[TelephonyNumber]) -> None:
-        self.number = number
-        self.released: List[Tuple[str, CallProvider]] = []
-        self.tokens: List[str] = []
-
-    def install(self, monkeypatch: pytest.MonkeyPatch) -> "ReleaseSpy":
-        async def fake_get(number_id: str):
-            return self.number
-
-        async def fake_release_number(number_id: str, provider: CallProvider):
-            self.released.append((number_id, provider))
-
-        async def fake_release_token(number_id: str, token=None):
-            self.tokens.append(number_id)
-            return True
-
-        async def fake_decrement(number_id: str):
-            self.released.append((number_id, CallProvider.PLIVO))
-
-        monkeypatch.setattr(calls_mod, "get_telephony_number_by_id", fake_get)
-        monkeypatch.setattr(calls_mod, "_release_number", fake_release_number)
-        monkeypatch.setattr(calls_mod, "release_channel_token", fake_release_token)
-        # Inbound goes through the shared module; patch its collaborators (not
-        # release_inbound_channel itself) so inbound_holds_channel stays in
-        # the loop — that predicate is the logic under test.
-        monkeypatch.setattr(ic_mod, "get_telephony_number_by_id", fake_get)
-        monkeypatch.setattr(
-            ic_mod, "decrement_telephony_number_channels", fake_decrement
-        )
-        return self
-
-
 # ── the release predicate ────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "provider,status,expected",
-    [
-        (CallProvider.PLIVO, LeadCallStatus.PROCESSING, True),
-        (CallProvider.PLIVO, LeadCallStatus.FINISHED, False),
-        (CallProvider.PLIVO, LeadCallStatus.BACKLOG, False),
-        # Only Plivo inbound is gated, so only Plivo inbound owes a channel.
-        (CallProvider.EXOTEL, LeadCallStatus.PROCESSING, False),
-        (CallProvider.TWILIO, LeadCallStatus.PROCESSING, False),
-    ],
-)
-def test_inbound_releases_only_when_it_acquired(provider, status, expected):
-    lead = make_inbound_lead(status=status)
-    assert calls_mod._releases_capacity(lead, provider) is expected
-
-
-@pytest.mark.parametrize(
-    "execution_mode,expected",
-    [
-        (ExecutionMode.TELEPHONY, True),
-        (ExecutionMode.TELEPHONY_TEST, True),
-        (ExecutionMode.DAILY, False),
-        (ExecutionMode.DAILY_TEST, False),
-    ],
-)
-def test_outbound_release_unchanged_by_the_refactor(execution_mode, expected):
-    """Outbound keys off execution mode, never off status or provider."""
-    for status in (LeadCallStatus.PROCESSING, LeadCallStatus.FINISHED):
-        lead = make_outbound_lead(status=status, execution_mode=execution_mode)
-        assert calls_mod._releases_capacity(lead, CallProvider.PLIVO) is expected
-
-
 # ── the release path ─────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_inbound_release_returns_channel_but_never_a_redis_token(monkeypatch):
-    """Inbound never takes a dispatch token, so it must not push one back —
-    that would hand outbound capacity that was never borrowed."""
-    spy = ReleaseSpy(make_number()).install(monkeypatch)
-    await calls_mod._release_call_resources(make_inbound_lead())
-    assert spy.released == [("num-1", CallProvider.PLIVO)]
-    assert spy.tokens == []
-
-
-@pytest.mark.asyncio
-async def test_outbound_release_returns_both_channel_and_token(monkeypatch):
-    spy = ReleaseSpy(make_number()).install(monkeypatch)
-    await calls_mod._release_call_resources(make_outbound_lead())
-    assert spy.released == [("num-1", CallProvider.PLIVO)]
-    assert spy.tokens == ["num-1"]
-
-
-@pytest.mark.asyncio
-async def test_duplicate_inbound_callback_releases_exactly_once(monkeypatch):
-    """Two webhooks for one call: the first sees PROCESSING, the second sees
-    the FINISHED row it wrote. Only one channel goes back."""
-    spy = ReleaseSpy(make_number()).install(monkeypatch)
-    await calls_mod._release_call_resources(
-        make_inbound_lead(LeadCallStatus.PROCESSING)
-    )
-    await calls_mod._release_call_resources(make_inbound_lead(LeadCallStatus.FINISHED))
-    assert len(spy.released) == 1
-
-
-@pytest.mark.asyncio
-async def test_capacity_rejected_call_never_releases(monkeypatch):
-    """A call turned away at the gate wrote a FINISHED row and never held a
-    channel. Releasing for it would invent capacity."""
-    spy = ReleaseSpy(make_number()).install(monkeypatch)
-    lead = make_inbound_lead(
-        status=LeadCallStatus.FINISHED,
-        outcome=ans_mod.CAPACITY_REJECTED_OUTCOME,
-    )
-    await calls_mod._release_call_resources(lead)
-    assert spy.released == []
-
-
-@pytest.mark.asyncio
-async def test_release_is_a_noop_without_a_telephony_number(monkeypatch):
-    spy = ReleaseSpy(None).install(monkeypatch)
-    await calls_mod._release_call_resources(make_inbound_lead(number_id=None))
-    assert spy.released == []
-
-
-@pytest.mark.asyncio
-async def test_release_survives_a_vanished_number_row(monkeypatch):
-    spy = ReleaseSpy(None).install(monkeypatch)
-    await calls_mod._release_call_resources(make_inbound_lead())
-    assert spy.released == []
 
 
 # ── the admission gate ───────────────────────────────────────────────────
@@ -305,24 +180,6 @@ HELD_BY = [
 ]
 
 
-@pytest.mark.parametrize("_lid,provider,direction,status,_mode,held", HELD_BY)
-def test_release_predicate_over_every_inbound_shape(
-    _lid, provider, direction, status, _mode, held
-):
-    """The inbound half of the matched pair, checked directly.
-
-    The other half — that the SQL counts exactly these rows — cannot be
-    asserted honestly without a database: substring checks on the query text
-    pass even when the whole predicate is negated. That half lives in
-    ``test_in_flight_count_against_postgres`` below, which runs the real SQL.
-    """
-    if direction != "INBOUND":
-        pytest.skip("outbound release keys off execution mode, not the row")
-
-    lead = make_inbound_lead(status=LeadCallStatus(status))
-    assert calls_mod._releases_capacity(lead, CallProvider(provider)) is held
-
-
 @pytest.mark.asyncio
 async def test_in_flight_count_against_postgres():
     """Run the REAL count query against a REAL database over every lead shape.
@@ -392,32 +249,6 @@ async def test_in_flight_count_against_postgres():
 
 
 # ── ordering guard ───────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_inbound_release_depends_on_a_pre_update_snapshot(monkeypatch):
-    """Regression guard for a trap in the refactor.
-
-    Inbound release is decided by reading ``lead.status`` off an in-memory
-    object. Both call sites work only because they pass a snapshot taken
-    while the lead was still PROCESSING — ``handle_call_completion`` releases
-    before its UPDATE, and the stuck sweep passes the pre-update copy. Refetch
-    the lead first and inbound silently stops returning channels, which
-    strangles every number one call at a time. This test fails if someone
-    'tidies' that ordering away.
-    """
-    spy = ReleaseSpy(make_number()).install(monkeypatch)
-
-    pre_update = make_inbound_lead(status=LeadCallStatus.PROCESSING)
-    await calls_mod._release_call_resources(pre_update)
-    assert len(spy.released) == 1, "a PROCESSING snapshot must return its channel"
-
-    post_update = make_inbound_lead(status=LeadCallStatus.FINISHED)
-    await calls_mod._release_call_resources(post_update)
-    assert len(spy.released) == 1, (
-        "a refetched (already FINISHED) lead releases nothing — release must "
-        "run before the completion UPDATE, not after"
-    )
 
 
 # ── the IVR deferred-policy block ────────────────────────────────────────
@@ -511,13 +342,6 @@ async def _drive_ivr_block(
     monkeypatch.setattr(ivr_mod, "get_lead_by_call_id", fake_get_lead)
     monkeypatch.setattr(ivr_mod, "update_lead_call_completion_details", fake_completion)
     monkeypatch.setattr(ivr_mod, "update_lead_template", fake_update_template)
-    # Patch the shared module's collaborators, not release_inbound_channel
-    # itself, so inbound_holds_channel stays in the loop — that predicate is
-    # the logic under test.
-    monkeypatch.setattr(ic_mod, "get_telephony_number_by_id", fake_get_number)
-    monkeypatch.setattr(
-        ic_mod, "decrement_telephony_number_channels", fake_release_number
-    )
 
     blocked = await ivr_mod._check_deferred_inbound_policy(
         # The block path only closes the socket; cast keeps the stub honest.
@@ -536,24 +360,13 @@ async def _drive_ivr_block(
 @pytest.mark.asyncio
 async def test_ivr_block_returns_the_channel_before_finishing_the_lead(monkeypatch):
     """A caller blocked after picking an IVR option still holds the channel the
-    answer-time gate took. The row is the receipt, so it must be refunded
-    before the row is finished — afterwards _releases_capacity sees FINISHED,
-    the call-end webhook correctly refunds nothing, the stuck sweep only scans
-    PROCESSING, and nothing reconciles telephony_numbers.channels. The channel
-    would be lost for good.
-    """
+    answer-time gate took. The finishing claim returns it in the same
+    statement (the rule is checked on Postgres), so there is no second
+    release step to lose or to repeat."""
     order = await _drive_ivr_block(monkeypatch, CallProvider.PLIVO)
 
-    assert "released_channel" in order, (
-        "IVR block finished the lead without returning its channel — the "
-        "number permanently loses one channel per blocked caller"
-    )
-    # Finish first, release second: the refund is conditional on the UPDATE
-    # actually transitioning the row, so a silently failed UPDATE cannot
-    # produce a second release from the websocket teardown path.
-    assert order.index(f"finished:{LeadCallStatus.FINISHED}") < order.index(
-        "released_channel"
-    ), "release must be gated on a confirmed completion UPDATE"
+    assert f"finished:{LeadCallStatus.FINISHED}" in order
+    assert "released_channel" not in order, "a second release would double it"
 
 
 @pytest.mark.asyncio
@@ -648,9 +461,7 @@ async def test_websocket_created_lead_owns_the_channel(monkeypatch):
     assert captured["call_direction"] == CallDirection.INBOUND
     assert captured["status"] == LeadCallStatus.PROCESSING
     assert captured["telephony_number_id"] == "num-1"
-    # Which means _releases_capacity will refund it exactly once at call end.
-    lead = make_inbound_lead(status=LeadCallStatus.PROCESSING)
-    assert calls_mod._releases_capacity(lead, CallProvider.PLIVO) is True
+    # Which means the finishing claim returns it exactly once at call end.
 
 
 # ── the dynamic INSERT column list ───────────────────────────────────────
@@ -780,7 +591,7 @@ async def test_ivr_block_claims_before_releasing(monkeypatch):
         "the IVR completion write is not an atomic claim, so a racing callback "
         "could refund the same channel twice"
     )
-    assert "released_channel" in order
+    assert "released_channel" not in order
 
 
 # ── the gate's real call site ────────────────────────────────────────────
@@ -907,6 +718,7 @@ async def test_accessor_forwards_expected_status_to_the_query(monkeypatch):
         meta_data=None,
         call_end_time=None,
         expected_status=None,
+        release_number=None,
     ):
         seen["expected_status"] = expected_status
         return "SELECT 1", []
