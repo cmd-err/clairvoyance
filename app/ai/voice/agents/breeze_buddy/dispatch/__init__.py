@@ -30,6 +30,7 @@ from app.ai.voice.agents.breeze_buddy.dispatch.reconcilers import (
     reap_stuck_processing_lists,
     reconcile_backlog_to_zset,
     reconcile_channel_tokens,
+    repair_dial_queue,
 )
 from app.ai.voice.agents.breeze_buddy.dispatch.worker import (
     start_workers,
@@ -48,6 +49,7 @@ __all__ = [
     "reap_stuck_processing_lists",
     "reconcile_backlog_to_zset",
     "feed_dial_queue_task",
+    "repair_dial_queue",
     "reconcile_channel_tokens",
     "release_channel_token",
     "schedule_lead",

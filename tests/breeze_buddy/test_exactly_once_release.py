@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -414,6 +415,10 @@ async def test_four_enders_racing_release_exactly_once(monkeypatch):
 # --- the claim on real Postgres ------------------------------------------------
 
 DSN = os.environ.get("DIALQ_TEST_DSN")
+MIGRATION = (
+    Path(__file__).resolve().parents[2]
+    / "app/database/migrations/086_create_dial_queue.sql"
+)
 
 
 @pytest.mark.asyncio
@@ -428,7 +433,7 @@ async def test_claim_is_atomic_on_postgres():
 
     admin = await asyncpg.connect(DSN)
     await admin.execute("""
-        DROP TABLE IF EXISTS lead_call_tracker, telephony_numbers;
+        DROP TABLE IF EXISTS lead_call_tracker, telephony_numbers, dial_queue;
         CREATE TABLE lead_call_tracker (
             id text PRIMARY KEY, status text, outcome text, meta_data jsonb,
             call_end_time timestamptz, updated_at timestamptz,
@@ -437,6 +442,9 @@ async def test_claim_is_atomic_on_postgres():
             id text PRIMARY KEY, channels int, maximum_channels int,
             status text, updated_at timestamptz, provider text);
         """)
+    # The finishing claim also touches dial_queue. No row here (an old-path
+    # call), so the caller's own release runs, as this test does.
+    await admin.execute(MIGRATION.read_text())
     conns = [await asyncpg.connect(DSN) for _ in range(20)]
     try:
         for _ in range(30):
@@ -470,7 +478,7 @@ async def test_claim_is_atomic_on_postgres():
         for c in conns:
             await c.close()
         await admin.execute(
-            "DROP TABLE IF EXISTS lead_call_tracker, telephony_numbers;"
+            "DROP TABLE IF EXISTS lead_call_tracker, telephony_numbers, dial_queue;"
         )
         await admin.close()
 
@@ -505,7 +513,9 @@ async def test_the_claim_returns_the_line_by_todays_rule_on_postgres():
     conn = await asyncpg.connect(DSN)
     try:
         await conn.execute("""
-            DROP TABLE IF EXISTS lead_call_tracker, telephony_numbers;
+            DROP TABLE IF EXISTS dial_queue, lead_call_tracker, telephony_numbers;
+            CREATE TABLE dial_queue (lead_id text PRIMARY KEY, state text,
+                number_id text);  -- the claim also drops the lead's row
             CREATE TABLE lead_call_tracker (
                 id text PRIMARY KEY, status text, outcome text, meta_data jsonb,
                 call_end_time timestamptz, updated_at timestamptz,
@@ -539,5 +549,7 @@ async def test_the_claim_returns_the_line_by_todays_rule_on_postgres():
             case = (direction, mode, provider, nstatus)
             assert (got["channels"], got["status"]) == (channels, status_after), case
     finally:
-        await conn.execute("DROP TABLE IF EXISTS lead_call_tracker, telephony_numbers;")
+        await conn.execute(
+            "DROP TABLE IF EXISTS dial_queue, lead_call_tracker, telephony_numbers;"
+        )
         await conn.close()

@@ -532,3 +532,27 @@ async def clear_throttle(alert_name: str) -> None:
 THROTTLE_P0 = _THROTTLE_P0
 THROTTLE_P1 = _THROTTLE_P1
 THROTTLE_P2 = _THROTTLE_P2
+
+
+async def raise_dialq_stuck(count: int) -> None:
+    """
+    P1 — dial_queue rows were still holding a line long after any task could
+    have used them: their dialler pod died mid-dial. Repair returned the
+    lines; this says it happened (a pattern means pods die mid-call).
+    """
+    await _send(
+        alert_name="dialq_stuck",
+        throttle_seconds=_THROTTLE_P1,
+        title="[P1] Breeze Buddy: dial_queue lines repaired after a pod died",
+        fields=[
+            {"name": "Rows repaired", "value": str(count)},
+            {
+                "name": "Action",
+                "value": (
+                    "Check dialler pod restarts/OOMs around this time. The "
+                    "lines are already back; repeated alerts mean pods are "
+                    "dying with calls in flight."
+                ),
+            },
+        ],
+    )

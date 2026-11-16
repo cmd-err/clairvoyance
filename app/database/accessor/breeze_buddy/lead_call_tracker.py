@@ -8,10 +8,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import asyncpg
 
 from app.core.logger import logger
-from app.database import READER_TIMEOUT_SECS
+from app.database import READER_TIMEOUT_SECS, db_connection
 from app.database.accessor.breeze_buddy.dial_queue import delete_waiting_dial
 from app.database.decoder.breeze_buddy.lead_call_tracker import decode_lead_call_tracker
 from app.database.queries import run_parameterized_query, run_reader_query
+from app.database.queries.breeze_buddy.dial_queue import (
+    lock_dial_row_query,
+    lock_lead_query,
+)
 from app.database.queries.breeze_buddy.lead_call_tracker import (
     abort_lead_by_id_query,
     acquire_lock_on_lead_by_id_query,
@@ -391,6 +395,14 @@ async def get_lead_by_call_id(call_id: str) -> Optional[LeadCallTracker]:
         return None
 
 
+async def fire_finished_hooks(lead_id: str) -> None:
+    """The ending of a lead finished outside this module (give-back of a
+    cancelled grant): fire the same finished hooks abort fires."""
+    lead = await get_lead_by_id(lead_id)
+    if lead is not None:
+        _fire_hooks(_finished_hooks, lead, "finished-lead")
+
+
 async def get_lead_by_id(lead_id: str) -> Optional[LeadCallTracker]:
     """
     Get lead by ID.
@@ -664,8 +676,10 @@ async def update_lead_call_completion_details(
             # Mirror the ending ONLY on the transition to FINISHED —
             # mid-call outcome writes (template hooks) pass status=None.
             if status == LeadCallStatus.FINISHED and decoded_result is not None:
-                # A finished lead must not keep a waiting dial_queue row.
-                await delete_waiting_dial(id)
+                if expected_status != LeadCallStatus.PROCESSING:
+                    # The claim drops its own row; other finishes drop a
+                    # waiting one here.
+                    await delete_waiting_dial(id)
                 _fire_hooks(_finished_hooks, decoded_result, "finished-lead")
             return decoded_result
 
@@ -882,9 +896,20 @@ async def handle_lead_abort(
     """
     try:
         query_text, values = abort_lead_by_id_query(lead_id, cancellation_reason)
-        result = await run_parameterized_query(query_text, values)
+        # The lead, then its dial_queue row, each locked as its own statement:
+        # the abort then decides on the row as it is AFTER any give-back or
+        # grant that held it (one statement would judge a row it saw before
+        # waiting).
+        async with db_connection() as conn:
+            async with conn.transaction():
+                for lock_text, lock_values in (
+                    lock_lead_query(lead_id),
+                    lock_dial_row_query(lead_id),
+                ):
+                    await conn.execute(lock_text, *lock_values)
+                result = await conn.fetch(query_text, *values)
 
-        if result and get_row_count(result) > 0:
+        if result:
             decoded_result = decode_lead_call_tracker(result[0])
             # Abort is a terminal transition that bypasses the completion
             # accessor — mirror its ending here (outcome=ABORT on the row).
