@@ -63,6 +63,7 @@ class ExotelProvider(VoiceCallProvider):
         telephony_number: str,
         reseller_id: Optional[str] = None,
         template_name: Optional[str] = None,
+        callback_params: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Initiate an outbound call via Exotel.

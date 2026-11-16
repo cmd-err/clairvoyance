@@ -202,6 +202,10 @@ async def _prewarm_initial_greeting_with_retry(
 # How long a lead waits when the merchant's call rule can't be evaluated
 # (Redis down, rule unreadable). Short: it is a transient, not a verdict.
 CALL_LIMIT_UNAVAILABLE_DEFER_S = 30
+# A dial whose outcome we do not know (no reply, a reply without a call id,
+# or the PROCESSING write failing after the call was placed) may be ringing:
+# wait long enough for Plivo's own webhook to report it before re-dialling.
+UNKNOWN_DIAL_DEFER_S = 300
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +759,9 @@ class Worker:
                     # answer-url observability tag only (never parsed back);
                     # id-only convention — no template names in routing.
                     template_name=locked.template_id or "",
+                    # Echoed on Plivo's webhooks: a dial we get no reply for
+                    # is attached to this lead when Plivo reports it.
+                    callback_params={"lead_id": str(locked.id), "number_id": number.id},
                 )
             except Exception as e:  # noqa: BLE001
                 logger.error(
@@ -785,7 +792,9 @@ class Worker:
                         locked, customer_mobile, call_limit_member
                     )
                 await _return_capacity(number, token)
-                lock_released = await self._defer_and_release(locked.id, 10)
+                lock_released = await self._defer_and_release(
+                    locked.id, 10 if call is None else UNKNOWN_DIAL_DEFER_S
+                )
                 return
 
             call_sid = str(call.get("sid"))
@@ -820,15 +829,19 @@ class Worker:
                 number.id,
             )
             if not updated:
-                # CAS lost (status changed under us). Call is placed; we now
-                # have an orphan call_sid. Log loudly and release resources.
+                # CAS lost, or the write failed: the call IS placed. Release
+                # the line, and keep the lead out of reach long enough for
+                # Plivo's webhook to attach the call to it (an unlocked BACKLOG
+                # lead would be re-dialled within a minute).
                 logger.error(
                     f"Worker {self._uuid}: post-make_call CAS lost for lead "
                     f"{locked.id} (call_sid={call_sid}). Releasing resources; "
                     "the call may be orphaned."
                 )
                 await _return_capacity(number, token)
-                lock_released = await self._release(locked.id)
+                lock_released = await self._defer_and_release(
+                    locked.id, UNKNOWN_DIAL_DEFER_S
+                )
                 return
 
             # Success — token stays held until call-end webhook fires.
