@@ -536,3 +536,20 @@ async def test_health_monitor_alerts_dispatch_halted_when_overdue(
 
     await rc.monitor_dispatch_health()
     assert halted == [500]
+
+
+async def test_reconcile_backlog_skips_the_per_number_dialler_templates(
+    fake_redis, monkeypatch
+):
+    seen: dict = {}
+
+    async def _fake_get(*a, **kw):
+        seen.update(kw)
+        return []
+
+    monkeypatch.setattr(rc, "get_unscheduled_backlog_leads", _fake_get)
+    monkeypatch.setattr(rc.worker_mod, "DIALQ_TEMPLATES", {"T-listed"})
+
+    await rc.reconcile_backlog_to_zset()
+
+    assert seen["exclude_templates"] == ["T-listed"]

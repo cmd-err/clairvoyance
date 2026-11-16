@@ -18,13 +18,16 @@ from app.database.queries.breeze_buddy.telephony_number import (
 
 
 def get_unscheduled_backlog_leads_query(
-    lookahead_seconds: int, limit: int
+    lookahead_seconds: int, limit: int, exclude_templates: List[str]
 ) -> Tuple[str, List[Any]]:
     """
     For ``reconcile_backlog_to_zset``: find BACKLOG rows that should be on
     the schedule. Bounded by a small lookahead window so the scan is cheap
     even on a large table — far-future leads are handled by subsequent
-    reconciler ticks as their firing time approaches.
+    reconciler ticks as their firing time approaches. Leads of
+    ``exclude_templates`` (the per-number dialler's) are skipped BEFORE the
+    limit: their waiting backlog is always the oldest due and would
+    otherwise fill every run.
     """
     text = f"""
         SELECT id, reseller_id, EXTRACT(EPOCH FROM next_attempt_at) * 1000 AS score_ms
@@ -33,10 +36,11 @@ def get_unscheduled_backlog_leads_query(
           AND "is_locked" = FALSE
           AND "execution_mode" IN ('TELEPHONY', 'TELEPHONY_TEST')
           AND "next_attempt_at" <= NOW() + ($1 || ' seconds')::interval
+          AND ("template_id" IS NULL OR "template_id" <> ALL($3::uuid[]))
         ORDER BY "next_attempt_at" ASC
         LIMIT $2;
     """
-    return text, [str(lookahead_seconds), limit]
+    return text, [str(lookahead_seconds), limit, exclude_templates]
 
 
 def count_processing_by_telephony_number_query() -> Tuple[str, List[Any]]:
