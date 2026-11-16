@@ -12,6 +12,13 @@ from app.ai.voice.agents.breeze_buddy.dispatch.channel_semaphore import (
     init_channel_semaphore,
     release_channel_token,
 )
+
+# dialq imports worker itself, so this order does not matter.
+from app.ai.voice.agents.breeze_buddy.dispatch.dialq import (  # noqa: E402
+    monitor_dialq_drift,
+    start_tick,
+    stop_tick,
+)
 from app.ai.voice.agents.breeze_buddy.dispatch.leader import LeaderElection
 from app.ai.voice.agents.breeze_buddy.dispatch.promoter import (
     start_promoter,
@@ -57,4 +64,7 @@ __all__ = [
     "start_workers",
     "stop_promoter",
     "stop_workers",
+    "monitor_dialq_drift",
+    "start_tick",
+    "stop_tick",
 ]

@@ -703,6 +703,13 @@ async def SHOPS_FOR_TEMPLATE_FLOW() -> list[str]:
     return [shop.strip() for shop in config_value.split(",") if shop.strip()]
 
 
+async def BB_DIALQ_NUMBERS() -> list[str]:
+    """Telephony number ids served by the per-number dialler (dial_queue),
+    comma-separated. Empty (default) = every number stays on the old path."""
+    config_value = await get_config("BB_DIALQ_NUMBERS", "", str)
+    return [n.strip() for n in config_value.split(",") if n.strip()]
+
+
 async def CAMPAIGN_MAX_LEADS() -> int:
     """Returns CAMPAIGN_MAX_LEADS from Redis"""
     return await get_config("CAMPAIGN_MAX_LEADS", 5000, int)

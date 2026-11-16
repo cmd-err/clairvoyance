@@ -1,8 +1,9 @@
 """dial_queue accessors.
 
-Fail-open on purpose: until the dialler reads this table (behind a per-number
-switch), a dial_queue problem must never break lead intake, cancel or call
-end. Each accessor logs and returns a falsy value instead of raising.
+The writes on the lead path (enqueue, cancel, call end, give-back) are
+fail-open: a dial_queue problem must never break lead intake, cancel or call
+end, so they log and return a falsy value. The tick's reads and fill raise:
+the tick logs and skips that one round.
 """
 
 import asyncio
