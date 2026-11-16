@@ -114,7 +114,7 @@ class _Harness:
         async def config(*_a: Any, **_k: Any) -> str:
             return "config"
 
-        async def release_resources(lead: LeadCallTracker) -> None:
+        async def release_resources(lead: LeadCallTracker, _owed: Any = None) -> None:
             self.resources_freed.append(lead.id)
 
         async def noop(*_a: Any, **_k: Any) -> None:
@@ -167,6 +167,7 @@ async def test_the_close_does_not_assert_a_cause_it_cannot_observe(
 
     assert h.closed["outcome"] == "UNKNOWN", "NO_ANSWER asserts an unobserved cause"
     assert h.closed["status"] == LeadCallStatus.FINISHED
+    assert h.closed["expected_status"] == LeadCallStatus.PROCESSING, "must claim"
     assert h.closed["meta_data"]["playground"] is True, "meta_data must merge"
     assert h.closed["meta_data"]["cleanup"] == "completed_no_pipeline"
     assert h.retried == ["lead-1"], "the customer is still called back"
@@ -294,9 +295,9 @@ async def _run_reaper_capturing_close(
     async def fake_acquire(*_args: Any, **_kwargs: Any) -> LeadCallTracker:
         return lead
 
-    async def fake_update(**kwargs: Any) -> None:
+    async def fake_update(**kwargs: Any) -> LeadCallTracker:
         captured.update(kwargs)
-        return None
+        return lead  # the reaper won the claim
 
     async def noop(*_args: Any, **_kwargs: Any) -> None:
         return None
