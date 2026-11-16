@@ -33,6 +33,7 @@ from .breeze_buddy.credentials import (
 )
 from .breeze_buddy.lead_call_tracker import (
     acquire_lock_on_lead_by_id,
+    adopt_unknown_dial,
     append_metadata_field,
     create_lead_call_tracker,
     defer_lead_next_attempt_and_release_lock,
@@ -114,6 +115,7 @@ __all__ = [
     "acquire_lock_on_lead_by_id",
     "release_lock_on_lead_by_id",
     "defer_lead_next_attempt_and_release_lock",
+    "adopt_unknown_dial",
     "update_lead_call_details",
     "get_lead_by_call_id",
     "get_lead_by_id",

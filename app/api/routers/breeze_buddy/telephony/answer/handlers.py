@@ -59,6 +59,9 @@ from app.ai.voice.agents.breeze_buddy.services.inbound_policy import (
     log_blocked_call,
     set_block_redirect,
 )
+from app.ai.voice.agents.breeze_buddy.services.telephony.base_provider import (
+    callback_signed,
+)
 from app.ai.voice.agents.breeze_buddy.services.telephony.plivo.recording import (
     plivo_record_xml,
 )
@@ -76,6 +79,7 @@ from app.core.logger import logger
 from app.core.logger.context import set_log_context
 from app.core.logger.timing import timed_phase
 from app.database.accessor import (
+    adopt_unknown_dial,
     get_call_execution_config_by_template_id,
     get_lead_by_call_id,
 )
@@ -911,6 +915,14 @@ async def _handle_provider_answer(request: Request, provider: str) -> Response:
     if not call_id:
         logger.error(f"[{tag}] Missing call ID")
         return _error_response(provider, "Missing call identifier", 400)
+
+    # A dial we got no reply for: Plivo echoes our lead and number ids, so the
+    # call is attached to its lead (a no-op when the lead is already PROCESSING).
+    lead_id = request.query_params.get("lead_id")
+    number_id = request.query_params.get("number_id") or ""
+    sig = request.query_params.get("sig") or ""
+    if lead_id and provider == "plivo" and callback_signed(lead_id, number_id, sig):
+        await adopt_unknown_dial(lead_id, str(call_id), number_id)
 
     # Resolve templates
     with timed_phase("resolve_call_templates"):

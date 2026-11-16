@@ -14,6 +14,7 @@ from app.database.queries import run_parameterized_query, run_reader_query
 from app.database.queries.breeze_buddy.lead_call_tracker import (
     abort_lead_by_id_query,
     acquire_lock_on_lead_by_id_query,
+    adopt_unknown_dial_query,
     append_metadata_field_query,
     count_recent_contacted_leads_query,
     defer_lead_next_attempt_and_release_lock_query,
@@ -307,6 +308,29 @@ async def defer_lead_next_attempt_and_release_lock(
 
     except Exception as e:
         logger.error(f"Error deferring lead next_attempt_at: {e}")
+        return None
+
+
+async def adopt_unknown_dial(
+    lead_id: str, call_id: str, telephony_number_id: str
+) -> Optional[LeadCallTracker]:
+    """Attach a call we got no dial reply for to its lead and count its line.
+    None when nothing matched (the normal case: the lead is already
+    PROCESSING) or on error; never raises into the webhook."""
+    try:
+        query_text, values = adopt_unknown_dial_query(
+            lead_id, call_id, telephony_number_id
+        )
+        result = await run_parameterized_query(query_text, values)
+        if result and get_row_count(result) > 0:
+            logger.warning(
+                f"Adopted call {call_id} for lead {lead_id}: its dial got no "
+                "reply, the provider's webhook reported it"
+            )
+            return decode_lead_call_tracker(result[0])
+        return None
+    except Exception as e:
+        logger.error(f"Error adopting call {call_id} for lead {lead_id}: {e}")
         return None
 
 
