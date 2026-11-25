@@ -15,6 +15,7 @@ from typing import Any, List
 
 import pytest
 
+from app.ai.voice.agents.breeze_buddy.dispatch.dialq import pick_leads
 from app.database.accessor.breeze_buddy import dial_queue as dq
 from app.database.queries.breeze_buddy.dial_queue import (
     due_templates_query,
@@ -38,11 +39,6 @@ MIGRATION = (
 NOW = datetime.now(timezone.utc)
 
 pytestmark = pytest.mark.skipif(not DSN, reason="set DIALQ_TEST_DSN")
-
-
-def pick_leads(k: int, live: Any, candidates: List[Any], room: Any = None) -> List[str]:
-    """Oldest first: the SQL is under test here, not the fairness rule."""
-    return [c["lead_id"] for c in sorted(candidates, key=lambda c: c["due_at"])][:k]
 
 
 @pytest.fixture
@@ -163,6 +159,42 @@ async def abort(pool: Any, lid: str) -> List[Any]:
         async with conn.transaction():
             await conn.execute(*_args(lock_lead_query(lid)))
             return await conn.fetch(*_args(abort_lead_by_id_query(lid, "x")))
+
+
+async def test_walkthrough_fairness(db):
+    """The walkthrough (steps 6, 11, 12, 20) on real rows."""
+    await number(db, lines=3)
+    hot, slow = str(uuid.uuid4()), str(uuid.uuid4())
+    for i in range(1, 5):
+        await waiting(db, f"H{i}", hot, "hot", 30 - i)
+    for i in range(1, 3):
+        await waiting(db, f"S{i}", slow, "slow", 15 - i)
+
+    first = await dq.fill_number("N1", [hot, slow], 3, pick_leads)
+    assert sorted(lid for lid, _ in first) == ["H1", "H2", "S1"]
+    assert await channels(db) == 3
+
+    tickets = dict(first)
+    # H2's merchant pre-check says "later": give-back, the line returns.
+    await db.execute(
+        "UPDATE lead_call_tracker SET next_attempt_at = now() + interval '1 hour' WHERE id='H2'"
+    )
+    await db.fetch(*_args(give_back_dial_query("H2", tickets["H2"])))
+    assert await channels(db) == 2
+
+    # Hot 1 live, Slow 1 live: a tie, so the older lead (H3) gets it.
+    assert [
+        lid for lid, _ in await dq.fill_number("N1", [hot, slow], 1, pick_leads)
+    ] == ["H3"]
+
+    # S1's call ends: Hot holds 2, Slow 0, so S2 gets the line although H4 is older.
+    await db.execute("UPDATE lead_call_tracker SET status='PROCESSING' WHERE id='S1'")
+    await db.execute("UPDATE dial_queue SET state='live' WHERE lead_id='S1'")
+    await db.fetch(*_args(_finish("S1")))
+    assert await channels(db) == 2
+    assert [
+        lid for lid, _ in await dq.fill_number("N1", [hot, slow], 1, pick_leads)
+    ] == ["S2"]
 
 
 def _args(built: tuple) -> tuple:

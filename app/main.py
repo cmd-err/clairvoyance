@@ -12,14 +12,17 @@ from app.ai.voice.agents.breeze_buddy.chat.cleanup import end_idle_chat_sessions
 from app.ai.voice.agents.breeze_buddy.dispatch import (
     clean_stale_bb_locks,
     feed_dial_queue_task,
+    monitor_dialq_drift,
     monitor_dispatch_health,
     reap_stuck_processing_lists,
     reconcile_backlog_to_zset,
     reconcile_channel_tokens,
     repair_dial_queue,
     start_promoter,
+    start_tick,
     start_workers,
     stop_promoter,
+    stop_tick,
     stop_workers,
 )
 from app.ai.voice.agents.breeze_buddy.managers.calls import (
@@ -230,6 +233,12 @@ async def lifespan(_app: FastAPI):
                     func=feed_dial_queue_task,
                     interval_seconds=300,
                 )
+                # dial_queue: channels vs calls holding lines (alert only).
+                _background_scheduler.register_task(
+                    name="bb_monitor_dialq_drift",
+                    func=monitor_dialq_drift,
+                    interval_seconds=300,
+                )
                 # dial_queue repair: lines held by rows whose pod died.
                 _background_scheduler.register_task(
                     name="bb_repair_dial_queue",
@@ -321,6 +330,9 @@ async def lifespan(_app: FastAPI):
                 )
 
             await start_promoter()
+            # Per-number dialler: idle until BB_DIALQ_NUMBERS lists a number.
+            # Before the workers, so they see which templates to hand over.
+            await start_tick()
             await start_workers()
             logger.info("Event-driven dispatcher started")
         except Exception as e:
@@ -369,6 +381,7 @@ async def lifespan(_app: FastAPI):
     if CRM_ROLE == "api" and ENABLE_DISPATCHER:
         try:
             logger.info("Stopping event-driven dispatcher...")
+            await stop_tick()
             await stop_workers()
             await stop_promoter()
         except Exception as e:

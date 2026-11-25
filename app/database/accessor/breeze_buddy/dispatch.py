@@ -18,7 +18,9 @@ from app.schemas import LeadCallTracker
 
 
 async def get_unscheduled_backlog_leads(
-    lookahead_seconds: int = 120, limit: int = 1000
+    lookahead_seconds: int = 120,
+    limit: int = 1000,
+    exclude_templates: Optional[List[str]] = None,
 ) -> List[Tuple[str, str, int]]:
     """
     Return ``(id, reseller_id, score_ms)`` triples for BACKLOG leads due
@@ -27,7 +29,9 @@ async def get_unscheduled_backlog_leads(
     """
     try:
         query, values = get_unscheduled_backlog_leads_query(
-            lookahead_seconds=lookahead_seconds, limit=limit
+            lookahead_seconds=lookahead_seconds,
+            limit=limit,
+            exclude_templates=exclude_templates or [],
         )
         rows = await run_parameterized_query(query, values)
         if not rows:
