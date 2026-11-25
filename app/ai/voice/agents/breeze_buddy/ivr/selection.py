@@ -23,9 +23,6 @@ from typing import Dict, List, Optional, Tuple
 from fastapi import WebSocket
 
 from app.ai.voice.agents.breeze_buddy.accounts import Accounts
-from app.ai.voice.agents.breeze_buddy.managers.inbound_channel import (
-    release_inbound_channel,
-)
 from app.ai.voice.agents.breeze_buddy.services.call_redirect import redirect_call
 from app.ai.voice.agents.breeze_buddy.services.inbound_policy import (
     check_inbound_policy,
@@ -276,15 +273,10 @@ async def _check_deferred_inbound_policy(
             # past maximum_channels in both directions, since _acquire_number
             # reads the same column.
             #
-            # `existing` is the pre-UPDATE snapshot and still reads PROCESSING,
-            # which is what release_inbound_channel keys on.
-            #
-            # This protects against other CLAIMING callers, not against
-            # handle_call_completion, which still releases off a pre-update
-            # snapshot and then updates unconditionally. That pairing is
-            # sequential in practice (this block closes the socket, which is
-            # what triggers the teardown), but it is not excluded by
-            # construction. Making every releaser claim first is tracked.
+            # The claim returns the channel in the same statement (the rule:
+            # inbound on Plivo/Vobiz), as every other ender's claim does
+            # (managers/calls.py), so it goes back exactly once and never
+            # comes apart from the FINISHED write.
             #
             # A successful REDIRECT is released here too, deliberately. It
             # leaves a real gap — redirect_call goes through
@@ -297,7 +289,7 @@ async def _check_deferred_inbound_policy(
             # terminal so no call-end path refunds it). A bounded over-admit
             # beats an unbounded leak. Fixing it properly needs the transfer to
             # own the channel for the life of its conference.
-            finished = await update_lead_call_completion_details(
+            await update_lead_call_completion_details(
                 id=existing.id,
                 status=LeadCallStatus.FINISHED,
                 outcome=outcome,
@@ -305,8 +297,6 @@ async def _check_deferred_inbound_policy(
                 call_end_time=datetime.now(timezone.utc),
                 expected_status=LeadCallStatus.PROCESSING,
             )
-            if finished:
-                await release_inbound_channel(existing)
             await update_lead_template(
                 lead_id=existing.id,
                 template=template.name,

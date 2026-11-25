@@ -667,6 +667,39 @@ def update_lead_call_completion_details_query(
 
     where_clause = " AND ".join(where_parts)
 
+    if (
+        status == LeadCallStatus.FINISHED
+        and expected_status == LeadCallStatus.PROCESSING
+    ):
+        # The claim returns the call's line in the same statement, reading the
+        # number itself, so "finished" and "line returned" can never come
+        # apart. Today's rule: an outbound call in a dialable mode holds one;
+        # an inbound call holds one on Plivo/Vobiz (taken at answer); a Twilio
+        # line is its IN_USE status, the others count channels.
+        text = f"""
+            WITH l AS (
+                UPDATE "{LEAD_CALL_TRACKER_TABLE}"
+                SET {", ".join(set_clauses)}
+                WHERE {where_clause}
+                RETURNING *
+            ), freed AS (
+                UPDATE "{TELEPHONY_NUMBER_TABLE}" t
+                   SET "channels" = CASE WHEN t."provider" = 'TWILIO' THEN t."channels"
+                                    ELSE GREATEST(0, COALESCE(t."channels", 0) - 1) END,
+                       "status" = CASE WHEN t."provider" = 'TWILIO' AND t."status" = 'IN_USE'
+                                  THEN 'AVAILABLE' ELSE t."status" END,
+                       "updated_at" = NOW()
+                  FROM l
+                 WHERE t."id" = l."telephony_number_id"
+                   AND ((l."call_direction" = 'OUTBOUND'
+                         AND l."execution_mode" IN ('TELEPHONY', 'TELEPHONY_TEST'))
+                     OR (l."call_direction" = 'INBOUND'
+                         AND t."provider" IN ('PLIVO', 'VOBIZ')))
+            )
+            SELECT * FROM l;
+        """
+        return text, values
+
     text = f"""
         UPDATE "{LEAD_CALL_TRACKER_TABLE}"
         SET {", ".join(set_clauses)}
