@@ -365,3 +365,12 @@ def get_merchants_with_call_limits_query() -> Tuple[str, List[Any]]:
         WHERE call_limits IS NOT NULL
     """
     return query, []
+
+
+def get_merchant_call_caps_query() -> Tuple[str, List[Any]]:
+    """Merchants with a concurrent-call cap on the per-number dialler."""
+    text = f"""
+        SELECT merchant_id, max_concurrent_calls
+        FROM "{MERCHANTS_TABLE}" WHERE max_concurrent_calls IS NOT NULL;
+    """
+    return text, []

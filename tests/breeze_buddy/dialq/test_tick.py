@@ -194,7 +194,13 @@ class Env:
         self.reads: List[str] = []
         dialq._routes.clear()
         dialq._routes_at[0] = -1e9
+        dialq._caps.update({"at": -1e9, "caps": {}})
         worker_mod.DIALQ_TEMPLATES.clear()
+
+        async def no_caps() -> dict:
+            return {}
+
+        monkeypatch.setattr(dialq, "get_merchant_call_caps", no_caps)
 
         async def listed() -> list:
             return self.listed
@@ -215,7 +221,9 @@ class Env:
         async def free(ids: list) -> dict:
             return {n: f for n, f in self.free.items() if n in ids}
 
-        async def fill(number_id: str, template_ids: list, k: int, pick: Any) -> list:
+        async def fill(
+            number_id: str, template_ids: list, k: int, pick: Any, caps: Any = None
+        ) -> list:
             self.fills.append((number_id, template_ids, k))
             return []
 
