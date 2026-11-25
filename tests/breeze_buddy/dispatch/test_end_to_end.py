@@ -19,8 +19,11 @@ Redis cluster behaviour, provider QPS handling.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import cast
+from typing import Any, cast
+
+import pytest
 
 from app.ai.voice.agents.breeze_buddy.dispatch import (
     channel_semaphore as cs_mod,
@@ -246,6 +249,25 @@ async def test_make_call_exception_releases_token_and_defers(harness, fake_redis
 
     # Lead is still BACKLOG (no PROCESSING update happened).
     assert lead.status == LeadCallStatus.BACKLOG
+
+
+async def test_a_dial_cut_off_mid_request_is_an_unknown_dial(harness, fake_redis):
+    """Shutdown cancels the task while the dial request is in flight: the call
+    may be ringing, so the line goes back and the lead waits, as for no SID."""
+    lead = make_lead("lead-cut")
+    harness.add_lead(lead)
+    harness.call_recorder = CallRecorder(raise_exc=cast(Any, asyncio.CancelledError()))
+    w.get_voice_provider = harness.get_voice_provider
+
+    await init_channel_semaphore(harness.number.id, 1)
+    await push_ready(fake_redis, lead.id)
+
+    with pytest.raises(asyncio.CancelledError):
+        await w.Worker(worker_uuid="w-cut")._iteration(session=None)
+
+    assert await channel_tokens_available(harness.number.id) == 1
+    assert harness.released_numbers == [harness.number.id]
+    assert harness.deferred == [(lead.id, w.UNKNOWN_DIAL_DEFER_S)]
 
 
 async def test_make_call_returns_no_sid_defers(harness, fake_redis):
@@ -986,14 +1008,15 @@ async def test_no_sid_frees_db_line_before_token(harness, fake_redis, monkeypatc
 
 async def test_every_pre_dial_failure_path_returns_capacity_in_one_place():
     """
-    The eight pre-dial failure paths all go through ``_return_capacity``;
-    no path pairs the two releases by hand, so the order cannot drift.
+    The nine failure paths (eight before the dial, and a dial cut off
+    mid-request) all go through ``_return_capacity``; no path pairs the two
+    releases by hand, so the order cannot drift.
     """
     import inspect
 
     src = inspect.getsource(w.Worker._dispatch)
     assert "release_channel_token(number.id, token)" in src  # the ERROR branch
-    assert src.count("_return_capacity(number, token)") == 8
+    assert src.count("_return_capacity(number, token)") == 9
     assert "_release_number(" not in src
 
 

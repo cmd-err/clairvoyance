@@ -15,6 +15,7 @@ from typing import Any, List, cast
 from app.ai.voice.agents.breeze_buddy.dispatch.alerts import (
     clear_throttle,
     raise_channel_drift,
+    raise_dialq_stuck,
     raise_dispatch_halted,
     raise_no_leader,
     raise_schedule_depth_high,
@@ -39,9 +40,14 @@ from app.ai.voice.agents.breeze_buddy.dispatch.queue import (
 from app.core.config import dynamic as dyn_cfg
 from app.core.logger import logger
 from app.database.accessor import (
+    drop_ended_live_rows,
     feed_dial_queue,
     get_all_telephony_numbers,
     get_lead_by_id,
+    give_back_dial,
+    mark_dial_live,
+    release_lock_on_lead_by_id,
+    stuck_dials,
 )
 from app.database.accessor.breeze_buddy.dispatch import (
     clean_stale_bb_locks as accessor_clean_stale_bb_locks,
@@ -68,6 +74,43 @@ async def feed_dial_queue_task() -> None:
     added = await feed_dial_queue(limit)
     if added:
         logger.info(f"feed_dial_queue: added {added} missing dial_queue rows")
+
+
+async def repair_dial_queue() -> None:
+    """
+    Return lines held by dial_queue rows whose dialler pod died. A live task
+    never stays ``granted`` for 10 minutes or ``dialing`` for 5 (every step
+    before the dial is time-bounded, the ring is at most 2 minutes), so only
+    dead pods' rows match. A slow but alive task that loses its line here
+    cannot dial: its ``claim_dialing`` fails on the ticket.
+
+    - granted: the pod died before dialling -> give back, unlock the lead.
+    - dialing, lead PROCESSING: the call is placed and recorded, only the
+      row's last step was lost -> live (the call's end returns the line).
+    - dialing otherwise: no call was recorded and the ring is over (a placed
+      call would have been adopted by its webhook) -> give back, unlock.
+    """
+    rows = await stuck_dials()
+    for row in rows:
+        lead_id, ticket = row["lead_id"], row["ticket"]
+        if (
+            row["state"] == "dialing"
+            and row["lead_status"] == LeadCallStatus.PROCESSING.value
+        ):
+            await mark_dial_live(lead_id, ticket)
+            continue
+        # A dialing row may have rung: a recorded cancel says so.
+        await give_back_dial(lead_id, ticket, row["state"] == "dialing")
+        await release_lock_on_lead_by_id(lead_id)
+    if rows:
+        logger.warning(f"repair_dial_queue: repaired {len(rows)} stuck dial_queue rows")
+        await raise_dialq_stuck(len(rows))
+    ended = await drop_ended_live_rows()
+    if ended:
+        logger.warning(
+            f"repair_dial_queue: dropped {ended} live rows whose lead already "
+            "ended without the finishing statement (an older pod image?)"
+        )
 
 
 async def reconcile_backlog_to_zset() -> None:
