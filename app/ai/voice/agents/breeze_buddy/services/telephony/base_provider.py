@@ -1,10 +1,26 @@
 import asyncio
+import hashlib
+import hmac
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
 
+from app.core.config.static import JWT_SECRET_KEY
 from app.schemas import CallProvider, TelephonyConfig
+
+
+def callback_signature(lead_id: str, number_id: str) -> str:
+    """Signs the lead/number ids we echo on provider webhooks, so only a URL
+    we built can attach a call to a lead (the webhook routes are open)."""
+    msg = f"{lead_id}:{number_id}".encode()
+    return hmac.new(JWT_SECRET_KEY.encode(), msg, hashlib.sha256).hexdigest()[:32]
+
+
+def callback_signed(lead_id: str, number_id: str, sig: str) -> bool:
+    if not JWT_SECRET_KEY or not sig.isascii():
+        return False  # no key: anyone could sign; non-ASCII: compare_digest raises
+    return hmac.compare_digest(sig, callback_signature(lead_id, number_id))
 
 
 class VoiceCallProvider(ABC):
@@ -50,6 +66,7 @@ class VoiceCallProvider(ABC):
         telephony_number: str,
         reseller_id: Optional[str] = None,
         template_name: Optional[str] = None,
+        callback_params: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Initiate a call.
@@ -63,6 +80,9 @@ class VoiceCallProvider(ABC):
             telephony_number: Caller ID / telephony number
             reseller_id: Optional merchant ID for tiered pod allocation
             template_name: Optional template name for WebSocket path routing
+            callback_params: Query params echoed on the provider's answer and
+                hangup webhooks, so a call we never got a reply for can be
+                matched to its lead (Plivo uses them; others ignore them)
         """
 
     async def make_call_async(
@@ -71,6 +91,7 @@ class VoiceCallProvider(ABC):
         telephony_number: str,
         reseller_id: Optional[str] = None,
         template_name: Optional[str] = None,
+        callback_params: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Await-able wrapper around ``make_call`` that keeps it off the event loop.
@@ -90,6 +111,7 @@ class VoiceCallProvider(ABC):
             telephony_number,
             reseller_id,
             template_name,
+            callback_params,
         )
 
     def set_completion_callback(self, callback):

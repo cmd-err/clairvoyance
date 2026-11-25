@@ -263,14 +263,16 @@ async def test_make_call_returns_no_sid_defers(harness, fake_redis):
 
     assert await channel_tokens_available(harness.number.id) == 1
     assert harness.released_numbers == [harness.number.id]
-    assert harness.deferred == [(lead.id, 10)]
+    assert harness.deferred == [(lead.id, w.UNKNOWN_DIAL_DEFER_S)]
     assert lead.status == LeadCallStatus.BACKLOG
 
 
 async def test_post_cas_lost_releases_all_resources(harness, fake_redis):
     """
-    CAS lost after make_call → token returned, number released, lock released.
-    The call is placed but the lead row already moved on (e.g., aborted).
+    CAS lost after make_call → token returned, number released, lead deferred.
+    The call is placed but the lead row already moved on (e.g., aborted), or
+    the write failed: the lead is kept out of reach long enough for Plivo's
+    webhook to attach the call to it, instead of being re-dialled at once.
     """
     lead = make_lead("lead-cas")
     harness.add_lead(lead)
@@ -288,7 +290,7 @@ async def test_post_cas_lost_releases_all_resources(harness, fake_redis):
     # All resources cleaned up despite orphaning the call.
     assert await channel_tokens_available(harness.number.id) == 1
     assert harness.released_numbers == [harness.number.id]
-    assert lead.id in harness.released_locks
+    assert harness.deferred == [(lead.id, w.UNKNOWN_DIAL_DEFER_S)]
 
 
 async def test_status_not_backlog_skips_dispatch(harness, fake_redis):
@@ -979,7 +981,7 @@ async def test_no_sid_frees_db_line_before_token(harness, fake_redis, monkeypatc
     assert order == ["db", "token"]
     assert harness.released_numbers == [harness.number.id]
     assert await channel_tokens_available(harness.number.id) == 1
-    assert harness.deferred == [(lead.id, 10)]
+    assert harness.deferred == [(lead.id, w.UNKNOWN_DIAL_DEFER_S)]
 
 
 async def test_every_pre_dial_failure_path_returns_capacity_in_one_place():
@@ -1131,3 +1133,21 @@ async def test_default_accessor_still_swallows_db_errors(monkeypatch):
     monkeypatch.setattr(tn_mod, "run_parameterized_query", _boom)
     assert await tn_mod.increment_telephony_number_channels("num-x") is None
     assert await calls_mod._acquire_number(_plivo_number()) is (w.NumberAcquire.ERROR)
+
+
+async def test_worker_passes_lead_and_number_ids_to_the_provider(harness, fake_redis):
+    """Echoed on Plivo's webhooks: a dial we get no reply for is attached to
+    its lead (and its line counted) when Plivo reports it."""
+    lead = make_lead("lead-ids")
+    harness.add_lead(lead)
+
+    await init_channel_semaphore(harness.number.id, 1)
+    await push_ready(fake_redis, lead.id)
+
+    worker = w.Worker(worker_uuid="w-ids")
+    await worker._iteration(session=None)
+
+    assert harness.call_recorder.calls[0]["callback_params"] == {
+        "lead_id": lead.id,
+        "number_id": harness.number.id,
+    }
