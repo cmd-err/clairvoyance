@@ -39,6 +39,7 @@ from app.ai.voice.agents.breeze_buddy.dispatch.queue import (
 from app.core.config import dynamic as dyn_cfg
 from app.core.logger import logger
 from app.database.accessor import (
+    feed_dial_queue,
     get_all_telephony_numbers,
     get_lead_by_id,
 )
@@ -54,6 +55,19 @@ from app.services.redis import get_redis_service
 # ---------------------------------------------------------------------------
 # reconcile_backlog_to_zset
 # ---------------------------------------------------------------------------
+
+
+async def feed_dial_queue_task() -> None:
+    """
+    Safety net for dial_queue: give every dispatchable BACKLOG lead that has no
+    row one (a failed insert, a lead created by a path that does not schedule).
+    Reads the due backlog once per run, like the reconciler above, so it runs
+    every 5 minutes rather than every minute.
+    """
+    limit = await dyn_cfg.BB_RECONCILE_BACKLOG_LIMIT() * 5
+    added = await feed_dial_queue(limit)
+    if added:
+        logger.info(f"feed_dial_queue: added {added} missing dial_queue rows")
 
 
 async def reconcile_backlog_to_zset() -> None:

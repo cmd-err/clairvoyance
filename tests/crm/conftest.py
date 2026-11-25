@@ -38,3 +38,16 @@ def _no_receipt_read_back(monkeypatch: pytest.MonkeyPatch):
         return None
 
     monkeypatch.setattr(dispatch, "backfill_early_receipts", _read_back)
+
+
+@pytest.fixture(autouse=True)
+def _no_dial_queue_write(monkeypatch: pytest.MonkeyPatch):
+    """The call square gives its lead a dial_queue row — real database work a
+    unit test must never reach. A no-op here; a test that watches it patches
+    over it (monkeypatch runs in order)."""
+    import app.crm.outreach.nodes.call as call_node
+
+    async def _enqueue(lead_id, due_at) -> bool:
+        return True
+
+    monkeypatch.setattr(call_node, "enqueue_dial", _enqueue)

@@ -942,7 +942,9 @@ class Worker:
         next_at = deferred.next_attempt_at or (
             datetime.now(timezone.utc) + timedelta(seconds=defer_seconds)
         )
-        await schedule_lead(lead_id, next_at)
+        # A defer only moves a lead later: its dial_queue row (if any) is
+        # never moved later (give-back owns that), so no write for it here.
+        await schedule_lead(lead_id, next_at, enqueue=False)
         return True
 
     async def _fail_and_release(self, lead_id: str, outcome: str) -> bool:

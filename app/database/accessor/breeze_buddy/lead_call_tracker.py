@@ -9,6 +9,7 @@ import asyncpg
 
 from app.core.logger import logger
 from app.database import READER_TIMEOUT_SECS
+from app.database.accessor.breeze_buddy.dial_queue import delete_waiting_dial
 from app.database.decoder.breeze_buddy.lead_call_tracker import decode_lead_call_tracker
 from app.database.queries import run_parameterized_query, run_reader_query
 from app.database.queries.breeze_buddy.lead_call_tracker import (
@@ -663,6 +664,8 @@ async def update_lead_call_completion_details(
             # Mirror the ending ONLY on the transition to FINISHED —
             # mid-call outcome writes (template hooks) pass status=None.
             if status == LeadCallStatus.FINISHED and decoded_result is not None:
+                # A finished lead must not keep a waiting dial_queue row.
+                await delete_waiting_dial(id)
                 _fire_hooks(_finished_hooks, decoded_result, "finished-lead")
             return decoded_result
 

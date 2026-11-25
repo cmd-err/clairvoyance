@@ -16,6 +16,7 @@ from typing import Any, Optional, cast
 from app.ai.voice.agents.breeze_buddy.dispatch.keys import SCHEDULE_ZSET
 from app.core.config.static import BB_DISPATCH_QPS_JITTER_MS
 from app.core.logger import logger
+from app.database.accessor import delete_waiting_dial, enqueue_dial
 from app.schemas import ExecutionMode
 from app.services.redis import get_redis_service
 
@@ -57,6 +58,7 @@ async def schedule_lead(
     lead_id: str,
     next_attempt_at: datetime,
     jitter_ms: Optional[int] = None,
+    enqueue: bool = True,
 ) -> bool:
     """
     ZADD a lead onto the schedule.
@@ -71,6 +73,10 @@ async def schedule_lead(
         jitter_ms: override default jitter; pass 0 for "no jitter" (operator)
     """
     score = _apply_jitter(_to_unix_ms(next_attempt_at), jitter_ms)
+    # The waiting row the per-number dialler fills from (un-jittered time;
+    # fail-open, so it can never fail the schedule).
+    if enqueue:
+        await enqueue_dial(lead_id, next_attempt_at)
     try:
         redis = await get_redis_service()
         client: Any = cast(Any, await redis.get_client())
@@ -87,6 +93,7 @@ async def cancel_scheduled_lead(lead_id: str) -> bool:
     doesn't pull a zombie. Safe to call even if the lead isn't on the schedule
     (ZREM is a no-op).
     """
+    await delete_waiting_dial(lead_id)
     try:
         redis = await get_redis_service()
         client: Any = cast(Any, await redis.get_client())
